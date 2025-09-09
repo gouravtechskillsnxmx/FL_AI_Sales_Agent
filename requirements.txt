@@ -5,3 +5,5 @@ openai
 pydantic
 python-multipart
 gunicorn
+langchain_community
+
