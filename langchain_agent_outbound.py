@@ -7,8 +7,75 @@ from typing import Dict, Optional
 # existing imports for langchain, agent, memory etc.
 # from langchain.chat_models import ChatOpenAI
 # ... your current LLM/agent setup ...
+# --- Add / ensure these definitions are present near the top of langchain_agent_outbound.py ---
+
+from typing import Dict
+import logging
 
 logger = logging.getLogger(__name__)
+
+# Simple in-memory scripted store (edit to your real script content)
+SCRIPTS: Dict[str, Dict[int, str]] = {
+    "default": {
+        0: "Hi, I'm calling from ExampleCorp. Do you have 30 seconds?",
+        1: "Great — we help companies reduce costs by up to 20% with our automation product.",
+        2: "Would you be interested in a short demo next week?",
+        3: "Thanks for your time! Can I confirm your email to send details?"
+    }
+}
+
+# conversation state store (in-memory). Persist in Redis/DB for production.
+CONVERSATION_STATE: Dict[str, int] = {}
+
+def get_script_segment_tool(input_text: str) -> str:
+    """
+    Minimal replacement for the LangChain tool. Accepts either:
+      - "script_id=default;state=1"
+      - or simply "default" (in which case state defaults to 0)
+    Returns the script line or a fallback string.
+    """
+    try:
+        if ";" in input_text:
+            parts = dict(part.split("=", 1) for part in input_text.split(";") if "=" in part)
+            script_id = parts.get("script_id", "default")
+            state = int(parts.get("state", 0))
+        else:
+            script_id = input_text or "default"
+            state = 0
+    except Exception:
+        script_id = "default"
+        state = 0
+
+    script = SCRIPTS.get(script_id, {})
+    return script.get(state, "[no more scripted lines]")
+
+# Optional: lightweight wrapper for calling LLM (if you already configured `agent` or `llm`,
+# you can keep your original call_llm logic). Here we add a safe fallback.
+def call_llm_safe(prompt: str, timeout_seconds: int = 8) -> str:
+    """
+    Try to call agent.run(prompt) if `agent` exists in globals.
+    Otherwise, return a fallback short reply.
+    """
+    if "agent" in globals() and globals().get("agent") is not None:
+        try:
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                future = ex.submit(globals()["agent"].run, prompt)
+                return future.result(timeout=timeout_seconds)
+        except Exception as e:
+            logger.exception("call_llm_safe: agent call failed: %s", e)
+            return "[llm_error]"
+    else:
+        # No agent configured — fallback
+        logger.info("call_llm_safe: no agent found, falling back to scripted reply")
+        return "[service_unavailable]"
+
+logger = logging.getLogger(__name__)
+
+
+
+
+
 
 # keep your SCRIPTS, CONVERSATION_STATE, agent, memory, llm etc. unchanged above
 
