@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: fl-ai-sales-agent
+    env: docker
+    branch: main
+    plan: free
+    dockerfilePath: Dockerfile
+    buildCommand: ""
+    startCommand: "gunicorn -k uvicorn.workers.UvicornWorker langchain_agent_outbound:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120"
