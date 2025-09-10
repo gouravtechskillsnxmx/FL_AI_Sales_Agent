@@ -1,3 +1,4 @@
+# ws_server.py
 import asyncio
 import base64
 import json
@@ -6,9 +7,10 @@ import os
 import uuid
 from urllib.parse import parse_qs
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Response
 
 # Import your core logic directly (no HTTP call)
+# ensure langchain_agent_outbound.py is in the same package/repo and defines process_user_text(...)
 from langchain_agent_outbound import process_user_text
 
 logging.basicConfig(level=logging.INFO)
@@ -17,22 +19,50 @@ logger = logging.getLogger("ws_server")
 app = FastAPI()
 
 # -------------------------------------------------------------------
-# Placeholder STT + TTS (replace with real APIs later)
+# Simple TwiML endpoint: Twilio fetches this URL to start streaming
+# -------------------------------------------------------------------
+@app.post("/twiml", response_class=Response)
+async def twiml():
+    """
+    Twilio will request this endpoint when placing a call.
+    It returns TwiML that tells Twilio to start a Media Stream to our websocket.
+    """
+    # Use the env var TWILIO_STREAM_TOKEN if set; otherwise default to axcydp34j7
+    token = os.getenv("TWILIO_STREAM_TOKEN", "axcydp34j7")
+    # Build a secure wss URL that includes the token as a query param
+    ws_url = f"wss://{os.getenv('RENDER_EXTERNAL_HOSTNAME', 'fl-ai-sales-agent2.onrender.com')}/twilio/stream?token={token}"
+    # You can optionally change the initial <Say> or remove the Pause
+    twiml_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Start>
+    <Stream url="{ws_url}"/>
+  </Start>
+  <Say voice="alice">Hello — please hold while I connect you.</Say>
+  <Pause length="1"/>
+</Response>"""
+    return Response(content=twiml_xml, media_type="application/xml")
+
+
+# -------------------------------------------------------------------
+# Placeholder STT + TTS (replace with real providers later)
 # -------------------------------------------------------------------
 def stt_from_wav_bytes(wav_bytes: bytes) -> str:
-    """Replace this with a real STT provider (e.g., Whisper, Google STT)."""
-    # For now, return dummy transcript
+    """Replace with real STT (Whisper/Google). For now returns placeholder."""
+    # TODO: implement real STT call
     return "[transcript placeholder]"
 
+
 def tts_synthesize_to_pcm16(text: str) -> bytes:
-    """Replace this with a real TTS provider (e.g., ElevenLabs, Polly).
-    Must return raw PCM16LE 16k mono bytes.
     """
-    # For now, return 160 ms silence at 16kHz (5120 bytes)
-    return b"\x00" * 5120
+    Replace with a real TTS provider (ElevenLabs / AWS Polly / Google).
+    Must return raw PCM16LE bytes sampled at 16k, mono.
+    For now return ~160ms silence.
+    """
+    return b"\x00" * 5120  # 160ms silence at 16k mono s16le
+
 
 # -------------------------------------------------------------------
-# ffmpeg converters: µ-law <-> PCM16
+# ffmpeg converters: µ-law <-> PCM16 (used by Twilio Media Streams)
 # -------------------------------------------------------------------
 async def mulaw_b64_to_wav_bytes(b64_payload: str) -> bytes:
     mu_bytes = base64.b64decode(b64_payload)
@@ -45,6 +75,7 @@ async def mulaw_b64_to_wav_bytes(b64_payload: str) -> bytes:
     out, _ = await p.communicate(mu_bytes)
     return out
 
+
 async def pcm16_bytes_to_mulaw_b64(pcm_bytes: bytes) -> str:
     p = await asyncio.create_subprocess_exec(
         "ffmpeg", "-f", "s16le", "-ar", "16000", "-ac", "1", "-i", "pipe:0",
@@ -55,17 +86,19 @@ async def pcm16_bytes_to_mulaw_b64(pcm_bytes: bytes) -> str:
     out, _ = await p.communicate(pcm_bytes)
     return base64.b64encode(out).decode("ascii")
 
+
 # -------------------------------------------------------------------
 # WebSocket handler for Twilio Media Streams
 # -------------------------------------------------------------------
 @app.websocket("/twilio/stream")
 async def twilio_stream(ws: WebSocket):
-    # --- Token validation ---
+    # Token validation (very simple): expects ?token=... in the ws URL
     qs = parse_qs(ws.scope.get("query_string", b"").decode())
     token = qs.get("token", [None])[0]
     expected = os.getenv("TWILIO_STREAM_TOKEN", "axcydp34j7")
     if token != expected:
         logger.warning("Invalid token in WS connect: %s", token)
+        # close with custom code (unauthorized)
         await ws.close(code=4401)
         return
 
@@ -84,28 +117,34 @@ async def twilio_stream(ws: WebSocket):
                 logger.info("Stream started: %s", stream_sid)
 
             elif event == "media":
+                # Incoming audio payload (base64 µ-law 8k)
                 payload_b64 = msg["media"]["payload"]
 
-                # µ-law b64 -> wav (PCM16k)
+                # Convert µ-law base64 -> wav PCM16k for STT
                 wav_bytes = await mulaw_b64_to_wav_bytes(payload_b64)
 
-                # STT (replace with real STT)
+                # Run STT (replace placeholder with real STT)
                 transcript = stt_from_wav_bytes(wav_bytes)
                 logger.info("Transcript: %s", transcript)
 
-                # Call core agent logic directly
-                result = process_user_text(
-                    script_id="default",
-                    convo_id=stream_sid or "unknown",
-                    user_text=transcript
-                )
+                # Call the in-process LangChain agent logic (fast, no HTTP)
+                try:
+                    result = process_user_text(
+                        script_id="default",
+                        convo_id=stream_sid or "unknown",
+                        user_text=transcript
+                    )
+                except Exception as e:
+                    logger.exception("process_user_text failed: %s", e)
+                    result = {"reply_text": "Sorry, I didn't understand that.", "used_script": True, "next_state": 0}
+
                 reply_text = result.get("reply_text", "Sorry, can you repeat?")
                 logger.info("Agent reply: %s", reply_text)
 
-                # TTS (replace with real)
+                # Synthesize TTS to PCM16 (replace with real TTS)
                 pcm_bytes = tts_synthesize_to_pcm16(reply_text)
 
-                # PCM16 -> µ-law b64
+                # Convert PCM16 -> µ-law base64 for Twilio playback
                 mulaw_b64 = await pcm16_bytes_to_mulaw_b64(pcm_bytes)
 
                 # Send back to Twilio
@@ -116,7 +155,7 @@ async def twilio_stream(ws: WebSocket):
                 }
                 await ws.send_text(json.dumps(out_msg))
 
-                # Mark end-of-playback
+                # Send mark to indicate end-of-playback (optional)
                 await ws.send_text(json.dumps({
                     "event": "mark",
                     "streamSid": stream_sid,
