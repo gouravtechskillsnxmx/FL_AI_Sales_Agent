@@ -18,6 +18,12 @@ logger = logging.getLogger("ws_server")
 
 app = FastAPI()
 
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
 # -------------------------------------------------------------------
 # Simple TwiML endpoint: Twilio fetches this URL to start streaming
 # -------------------------------------------------------------------
@@ -74,6 +80,21 @@ async def mulaw_b64_to_wav_bytes(b64_payload: str) -> bytes:
     )
     out, _ = await p.communicate(mu_bytes)
     return out
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+@app.post("/respond", response_model=RespondResponse)
+async def respond(payload: RespondRequest):
+    result = process_user_text(payload.script_id, payload.convo_id, payload.user_text)
+    return RespondResponse(
+        reply_text=result["reply_text"],
+        used_script=result["used_script"],
+        next_state=result["next_state"]
+    )
 
 
 async def pcm16_bytes_to_mulaw_b64(pcm_bytes: bytes) -> str:
