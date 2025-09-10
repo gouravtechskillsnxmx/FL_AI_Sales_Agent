@@ -44,21 +44,41 @@ CONVERSATION_STATE: Dict[str, int] = {}
 # -------------------------
 def get_script_segment_tool(input_text: str) -> str:
     """
-    Input formats:
+    Robust parser for inputs like:
       - "script_id=default;state=1"
+      - "'script_id=default;state=1'"
       - "default"
-    Supports SCRIPTS entries in either dict(state->line) or list/tuple form.
+    Works with SCRIPTS entries that are dict (state->line) or list/tuple.
     """
     try:
-        if ";" in input_text:
-            parts = dict(part.split("=", 1) for part in input_text.split(";") if "=" in part)
-            script_id = parts.get("script_id", "default")
-            state = int(parts.get("state", 0))
-        else:
-            script_id = (input_text or "default").strip()
+        if not input_text:
+            script_id = "default"
             state = 0
+        else:
+            # Remove surrounding quotes and whitespace (single or double)
+            txt = str(input_text).strip()
+            if (txt.startswith("'") and txt.endswith("'")) or (txt.startswith('"') and txt.endswith('"')):
+                txt = txt[1:-1].strip()
+
+            # If semicolon syntax, parse key=val pairs
+            if ";" in txt:
+                parts = {}
+                for part in txt.split(";"):
+                    if "=" in part:
+                        k, v = part.split("=", 1)
+                        parts[k.strip()] = v.strip()
+                script_id = parts.get("script_id", "default")
+                state_raw = parts.get("state", "0")
+                # Remove any non-digit characters from state (defensive)
+                import re
+                m = re.search(r"(-?\d+)", state_raw)
+                state = int(m.group(1)) if m else 0
+            else:
+                # txt may be just the script_id
+                script_id = txt or "default"
+                state = 0
     except Exception as e:
-        logger.exception("Failed parsing script input '%s': %s", input_text, e)
+        logger.exception("Failed parsing script input %r: %s", input_text, e)
         script_id = "default"
         state = 0
 
