@@ -22,6 +22,22 @@ class RespondResponse(BaseModel):
     used_script: bool
     next_state: int
 
+
+# langchain_agent_outbound.py
+
+# Stores conversation state per conversation ID
+CONVERSATION_STATE: dict = {}
+
+# Example script storage (if not already defined)
+SCRIPTS = {
+    "default": [
+        "Hi, I'm calling from ExampleCorp. We help companies reduce costs by up to 20% with our automation product. What specific services are you interested in?",
+        "Our solution integrates easily with existing systems. Would you like me to send over more details or schedule a quick demo?",
+        "Great, thank you for your time. We'll follow up shortly with more information."
+    ]
+}
+
+
 # ---------- New reusable function ----------
 def process_user_text(script_id: str, convo_id: str, user_text: str) -> Dict:
     """
