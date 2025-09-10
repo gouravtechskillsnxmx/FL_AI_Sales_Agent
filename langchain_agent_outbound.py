@@ -10,9 +10,16 @@ from typing import Dict, Optional
 # --- Add / ensure these definitions are present near the top of langchain_agent_outbound.py ---
 
 from typing import Dict
-import logging
+import  sys
 
-logger = logging.getLogger(__name__)
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    stream=sys.stdout,
+)
+logger = logging.getLogger("fl_ai_sales")
+
 
 # Simple in-memory scripted store (edit to your real script content)
 SCRIPTS: Dict[str, Dict[int, str]] = {
@@ -27,27 +34,55 @@ SCRIPTS: Dict[str, Dict[int, str]] = {
 # conversation state store (in-memory). Persist in Redis/DB for production.
 CONVERSATION_STATE: Dict[str, int] = {}
 
+# langchain_agent_outbound.py (near top, after SCRIPTS and CONVERSATION_STATE definitions)
+
+
 def get_script_segment_tool(input_text: str) -> str:
     """
-    Minimal replacement for the LangChain tool. Accepts either:
+    Accepts:
       - "script_id=default;state=1"
-      - or simply "default" (in which case state defaults to 0)
-    Returns the script line or a fallback string.
+      - "default" (script_id only)
+    Returns the appropriate script line. Supports SCRIPTS entries
+    stored as either dict(state->line) or list([line0, line1,..]).
+    Logs a helpful warning when a script isn't found or format is unexpected.
     """
     try:
+        # parse "script_id=default;state=1" or just "default"
         if ";" in input_text:
             parts = dict(part.split("=", 1) for part in input_text.split(";") if "=" in part)
             script_id = parts.get("script_id", "default")
             state = int(parts.get("state", 0))
         else:
-            script_id = input_text or "default"
+            script_id = (input_text or "default").strip()
             state = 0
-    except Exception:
+    except Exception as e:
+        logger.exception("Failed parsing script input '%s': %s", input_text, e)
         script_id = "default"
         state = 0
 
-    script = SCRIPTS.get(script_id, {})
-    return script.get(state, "[no more scripted lines]")
+    script = SCRIPTS.get(script_id)
+    if script is None:
+        logger.warning("Script id '%s' not found. Returning fallback.", script_id)
+        return "[no script found]"
+
+    # If script is a dict (state->line)
+    if isinstance(script, dict):
+        return script.get(state, "[no more scripted lines]")
+
+    # If script is a list/tuple: state is index
+    if isinstance(script, (list, tuple)):
+        if 0 <= state < len(script):
+            return script[state]
+        else:
+            logger.info("Script '%s' index %s out of range (len=%d).", script_id, state, len(script))
+            return "[no more scripted lines]"
+
+    # Unexpected type
+    logger.warning("Script '%s' is of unsupported type %s", script_id, type(script))
+    return "[invalid script format]"
+
+t0 = time.time()
+logger.info("Calling LLM for convo=%s", convo_id)
 
 # Optional: lightweight wrapper for calling LLM (if you already configured `agent` or `llm`,
 # you can keep your original call_llm logic). Here we add a safe fallback.
@@ -72,6 +107,9 @@ def call_llm_safe(prompt: str, timeout_seconds: int = 8) -> str:
 
 logger = logging.getLogger(__name__)
 
+
+# call...
+logger.info("LLM reply received in %.2fs", time.time()-t0)
 
 
 
@@ -103,6 +141,8 @@ SCRIPTS = {
         "Great, thank you for your time. We'll follow up shortly with more information."
     ]
 }
+
+logger.info("process_user_text convo=%s state=%s user_text=%s", convo_id, state, user_text[:120])
 
 
 # ---------- New reusable function ----------

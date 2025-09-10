@@ -12,8 +12,16 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Response
 # Import your core logic directly (no HTTP call)
 # ensure langchain_agent_outbound.py is in the same package/repo and defines process_user_text(...)
 from langchain_agent_outbound import process_user_text
+import sys
 
-logging.basicConfig(level=logging.INFO)
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    stream=sys.stdout,
+)
+logger = logging.getLogger("fl_ai_sales")
+
 logger = logging.getLogger("ws_server")
 
 app = FastAPI()
