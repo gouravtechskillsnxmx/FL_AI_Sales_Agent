@@ -18,6 +18,35 @@ logger = logging.getLogger("ws_server")
 
 app = FastAPI()
 
+# place this after `app = FastAPI()` and before any uses of RespondRequest/RespondResponse
+
+from pydantic import BaseModel
+from typing import Optional
+
+class RespondRequest(BaseModel):
+    script_id: Optional[str] = "default"
+    convo_id: Optional[str] = "global"
+    user_text: str
+
+class RespondResponse(BaseModel):
+    reply_text: str
+    used_script: bool
+    next_state: int
+
+@app.post("/respond", response_model=RespondResponse)
+async def respond(payload: RespondRequest):
+    """
+    POST /respond
+    Accepts JSON: { "script_id": "...", "convo_id": "...", "user_text": "..." }
+    Returns JSON with reply_text, used_script, next_state.
+    """
+    # Call the in-process agent function (ensure it's imported earlier)
+    result = process_user_text(payload.script_id, payload.convo_id, payload.user_text)
+    return RespondResponse(
+        reply_text=result.get("reply_text", ""),
+        used_script=result.get("used_script", True),
+        next_state=result.get("next_state", 0)
+    )
 
 
 @app.get("/health")
@@ -80,21 +109,6 @@ async def mulaw_b64_to_wav_bytes(b64_payload: str) -> bytes:
     )
     out, _ = await p.communicate(mu_bytes)
     return out
-
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
-
-@app.post("/respond", response_model=RespondResponse)
-async def respond(payload: RespondRequest):
-    result = process_user_text(payload.script_id, payload.convo_id, payload.user_text)
-    return RespondResponse(
-        reply_text=result["reply_text"],
-        used_script=result["used_script"],
-        next_state=result["next_state"]
-    )
 
 
 async def pcm16_bytes_to_mulaw_b64(pcm_bytes: bytes) -> str:
