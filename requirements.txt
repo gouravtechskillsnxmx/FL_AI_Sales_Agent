@@ -5,5 +5,14 @@ openai
 pydantic
 python-multipart
 gunicorn
-langchain_community
+aiohttp
+flask
+twilio
+openai
+boto3
+gTTS
+gunicorn
+python-dotenv
+redis
+rq
 
