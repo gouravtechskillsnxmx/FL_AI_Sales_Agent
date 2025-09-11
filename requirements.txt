@@ -8,7 +8,7 @@ gunicorn
 aiohttp
 flask
 twilio
-openai
+openai>=1.0.0
 boto3
 gTTS
 gunicorn
@@ -16,4 +16,5 @@ python-dotenv
 redis
 rq
 langchain_community
+
 

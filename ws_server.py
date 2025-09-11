@@ -26,7 +26,7 @@ from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 
 import requests
-import openai
+#import openai
 import boto3
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse
@@ -42,6 +42,19 @@ OPENAI_KEY = os.environ.get("OPENAI_KEY")
 S3_BUCKET = os.environ.get("S3_BUCKET")  # bucket must be public-read or use presigned URL
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 HOSTNAME = os.environ.get("HOSTNAME", "")  # optional: fl-ai-sales-agent3.onrender.com
+
+
+# Replace old openai import / api_key usage with the new OpenAI client
+try:
+    # new style (openai>=1.0.0)
+    from openai import OpenAI
+    openai_client = OpenAI(api_key=OPENAI_KEY) if OPENAI_KEY else OpenAI()
+except Exception:
+    # fallback for older installs (rare)
+    import openai as _old_openai
+    _old_openai.api_key = OPENAI_KEY
+    openai_client = None
+
 
 # init clients
 twilio_client = Client(TWILIO_SID, TWILIO_TOKEN) if TWILIO_SID and TWILIO_TOKEN else None
@@ -255,11 +268,40 @@ async def process_recording_background(call_sid: str, recording_url: str):
 # STT and TTS helper functions
 # -------------------------
 def transcribe_with_openai(file_path: str) -> str:
-    """Blocking; uses OpenAI audio transcription endpoint."""
-    with open(file_path, "rb") as f:
-        # Replace model name as per your available models
-        resp = openai.Audio.transcribe("whisper-1", f)
-    return resp.get("text", "").strip()
+    """
+    Transcribe audio file using OpenAI new Python client (openai>=1.0.0).
+    If you prefer the old client, pin openai==0.28 and restore the old call.
+    """
+    # Prefer the new client if available
+    if 'openai_client' in globals() and openai_client:
+        # choose model: "gpt-4o-transcribe" or "whisper-1" depending on availability
+        model_name = "gpt-4o-transcribe"  # or "whisper-1" if you want whisper
+        with open(file_path, "rb") as audio_f:
+            resp = openai_client.audio.transcriptions.create(
+                model=model_name,
+                file=audio_f
+            )
+        # resp typically has a .text attribute or a 'text' key
+        text = getattr(resp, "text", None)
+        if text is None:
+            try:
+                text = resp.get("text")  # dict-like fallback
+            except Exception:
+                text = str(resp)
+        return text.strip() if isinstance(text, str) else str(text)
+
+    # Fallback to old openai package API (if you pinned openai==0.28)
+    try:
+        import openai as _old_openai
+        with open(file_path, "rb") as f:
+            # older API: openai.Audio.transcribe(...)
+            resp = _old_openai.Audio.transcribe("whisper-1", f)
+        return resp.get("text", "").strip()
+    except Exception as e:
+        # provide a helpful error in logs
+        logger.exception("No OpenAI client available or transcription failed: %s", e)
+        raise
+
 
 def create_and_upload_tts(text: str) -> str:
     """Synchronous gTTS -> mp3 -> upload to S3 -> return public URL"""
