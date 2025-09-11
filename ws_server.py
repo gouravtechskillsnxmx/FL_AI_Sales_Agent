@@ -250,7 +250,7 @@ async def pcm16_bytes_to_mulaw_b64(pcm_bytes: bytes) -> str:
 # -------------------------
 # Twilio Media Streams WebSocket handler
 # -------------------------
-@app.websocket("/twilio/stream")
+"""@app.websocket("/twilio/stream")
 async def twilio_stream(ws: WebSocket):
     # Validate token from query string
     qs = parse_qs(ws.scope.get("query_string", b"").decode())
@@ -323,3 +323,4 @@ async def twilio_stream(ws: WebSocket):
             await ws.close()
         except:
             pass
+"""
