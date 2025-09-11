@@ -31,6 +31,9 @@ import boto3
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse
 from gtts import gTTS
+from fastapi import Response
+import requests
+from requests.auth import HTTPBasicAuth
 
 # ---------------- env/config ----------------
 TWILIO_SID = os.environ.get("TWILIO_SID")
@@ -150,11 +153,11 @@ async def twiml(request: Request):
 # Recording webhook (Twilio posts after a Record completes)
 # -------------------------
 @app.post("/recording")
+@app.post("/recording")
 async def recording(request: Request, background_tasks: BackgroundTasks):
     """
     Twilio will POST recording metadata here after each Record completes.
-    Fields include RecordingUrl, CallSid, etc.
-    We quickly acknowledge (204) and run the heavy work in background.
+    We respond immediately with 204 No Content and process the audio in background.
     """
     form = await request.form()
     recording_url = form.get("RecordingUrl")
@@ -163,11 +166,13 @@ async def recording(request: Request, background_tasks: BackgroundTasks):
     to_number = form.get("To")
 
     if not recording_url or not call_sid:
+        logger.warning("Missing RecordingUrl or CallSid in /recording payload: %s", dict(form))
         return JSONResponse({"error": "missing RecordingUrl or CallSid"}, status_code=400)
 
-    # schedule background processing so Twilio isn't waiting
+    # enqueue background processing (fast ack)
     background_tasks.add_task(process_recording_background, call_sid, recording_url)
-    return JSONResponse({}, status_code=204)
+    # important: return an empty 204 (no body/content-length)
+    return Response(status_code=204)
 
 # -------------------------
 # Background processing pipeline
@@ -175,28 +180,39 @@ async def recording(request: Request, background_tasks: BackgroundTasks):
 async def process_recording_background(call_sid: str, recording_url: str):
     """
     Background pipeline:
-    1) download recording (add .mp3)
-    2) transcribe (STT) -> transcript text
-    3) call process_user_text (agent) -> get reply_text
-    4) create TTS -> upload -> get public URL
-    5) tell Twilio to Play the audio in the call, then re-record (loop)
+      - download recording (requires Twilio basic auth)
+      - transcribe (STT)
+      - call agent -> get assistant_text
+      - create TTS -> upload -> get public URL
+      - instruct Twilio to play audio into call (calls.update)
     """
     try:
         logger.info("[%s] downloading recording: %s", call_sid, recording_url)
-        r = requests.get(recording_url + ".mp3", timeout=30)
-        r.raise_for_status()
+        download_url = recording_url + ".mp3"
+        # Use Basic Auth with Twilio Account SID and Auth Token
+        if not (TWILIO_SID and TWILIO_TOKEN):
+            logger.error("TWILIO_SID or TWILIO_TOKEN not set; cannot download recording.")
+            return
+
+        # include auth here to avoid 401
+        r = requests.get(download_url, auth=HTTPBasicAuth(TWILIO_SID, TWILIO_TOKEN), timeout=30)
+        try:
+            r.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            logger.exception("[%s] Failed to download recording: %s %s", call_sid, download_url, e)
+            return
+
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
         tmp.write(r.content)
         tmp.flush()
         tmp.close()
         file_path = tmp.name
 
-        # 2) STT: transcribe file. Replace this with your preferred STT provider.
+        # STT (blocking) - run in executor if long; here it's synchronous
         transcript = transcribe_with_openai(file_path)
         logger.info("[%s] transcript: %s", call_sid, transcript)
 
-        # 3) call agent
-        # process_user_text(script_id, convo_id, user_text)
+        # call the agent (sync or async)
         if asyncio.iscoroutinefunction(process_user_text):
             result = await process_user_text("default", call_sid, transcript)
         else:
@@ -207,27 +223,33 @@ async def process_recording_background(call_sid: str, recording_url: str):
         if not assistant_text:
             assistant_text = "Sorry, I couldn't understand. Could you repeat that?"
 
-        # 4) TTS: create and upload
+        # TTS -> upload
         tts_url = create_and_upload_tts(assistant_text)
         logger.info("[%s] tts_url: %s", call_sid, tts_url)
 
-        # 5) Tell Twilio to play audio and then re-enter Record to capture next user utterance
         # Build TwiML: play the TTS and then record again
-        record_action = f"https://{HOSTNAME}/recording" if HOSTNAME else f"https://{twilio_client.rest.core.base_uri.split('//')[-1]}/recording"
+        # Use HOSTNAME env var if set to ensure https scheme
+        if HOSTNAME:
+            record_action = f"https://{HOSTNAME}/recording"
+        else:
+            # fallback to Twilio-safe default: use https and your domain if not known
+            record_action = f"https://{request_host_for_background()}/recording" if 'request_host_for_background' in globals() else f"/recording"
+
         twiml = f"""<Response>
             <Play>{tts_url}</Play>
             <Record maxLength="5" action="{record_action}" playBeep="true" timeout="2"/>
         </Response>"""
+
         try:
             if twilio_client:
                 twilio_client.calls(call_sid).update(twiml=twiml)
             else:
-                logger.warning("Twilio client not configured; cannot update call %s", call_sid)
+                logger.warning("[%s] Twilio client not configured; cannot update call", call_sid)
         except Exception as e:
-            logger.exception("Error updating Twilio call %s: %s", call_sid, e)
+            logger.exception("[%s] Error updating Twilio call: %s", call_sid, e)
 
     except Exception as e:
-        logger.exception("Error in processing recording for %s: %s", call_sid, e)
+        logger.exception("[%s] Unexpected error in process_recording_background: %s", call_sid, e)
 
 # -------------------------
 # STT and TTS helper functions
