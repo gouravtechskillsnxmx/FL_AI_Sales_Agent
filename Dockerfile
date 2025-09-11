@@ -48,4 +48,4 @@ HEALTHCHECK --interval=15s --timeout=3s --start-period=10s --retries=3 \
 
 # Start command (uses $PORT if set; fallback to 8000)
 # Render supports using this Dockerfile directly. The command expands PORT at runtime.
-CMD ["/bin/sh", "-lc", "gunicorn -k uvicorn.workers.UvicornWorker ws_server:app --bind 0.0.0.0:${PORT:-8000} --workers 2 --timeout 120"]
+CMD ["/bin/sh", "-lc", "gunicorn ws_server:app -k uvicorn.workers.UvicornWorker -b 0.0.0.0:$PORT --workers 1 --timeout 120"]
