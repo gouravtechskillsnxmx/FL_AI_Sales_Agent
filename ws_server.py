@@ -303,18 +303,43 @@ def transcribe_with_openai(file_path: str) -> str:
         raise
 
 
-def create_and_upload_tts(text: str) -> str:
-    """Synchronous gTTS -> mp3 -> upload to S3 -> return public URL"""
+def create_and_upload_tts(text: str, expires_in: int = 120) -> str:
+    """
+    Create TTS (gTTS prototyping) -> upload to S3 WITHOUT ACL -> return presigned GET URL.
+    Twilio can fetch the presigned URL (HTTPS) to play the audio.
+    """
+    # create mp3 locally
     tts = gTTS(text=text, lang="en")
     tmp_tts = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
     tmp_tts_name = tmp_tts.name
     tmp_tts.close()
     tts.save(tmp_tts_name)
 
+    # build key and upload WITHOUT ACL (buckets with ACLs disabled reject ACL requests)
     key = f"tts/{os.path.basename(tmp_tts_name)}"
-    s3.upload_file(tmp_tts_name, S3_BUCKET, key, ExtraArgs={"ACL": "public-read", "ContentType": "audio/mpeg"})
-    url = f"https://{S3_BUCKET}.s3.amazonaws.com/{key}"
-    return url
+    try:
+        s3.upload_file(
+            tmp_tts_name,
+            S3_BUCKET,
+            key,
+            ExtraArgs={"ContentType": "audio/mpeg"}  # no ACL here
+        )
+    except Exception as e:
+        logger.exception("Failed to upload %s to %s/%s: %s", tmp_tts_name, S3_BUCKET, key, e)
+        raise
+
+    # generate a presigned GET URL so Twilio can fetch it securely
+    try:
+        presigned = s3.generate_presigned_url(
+            ClientMethod='get_object',
+            Params={'Bucket': S3_BUCKET, 'Key': key},
+            ExpiresIn=expires_in
+        )
+        return presigned
+    except Exception as e:
+        logger.exception("Failed to create presigned URL for %s/%s: %s", S3_BUCKET, key, e)
+        # As a fallback, return the object URL (works only if bucket/object is public)
+        return f"https://{S3_BUCKET}.s3.amazonaws.com/{key}"
 
 # -------------------------
 # (Optional) Twilio Media Streams WebSocket handler (kept as example)
