@@ -15,4 +15,5 @@ gunicorn
 python-dotenv
 redis
 rq
+langchain_community
 
