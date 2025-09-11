@@ -20,6 +20,31 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Response
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 
+# continue in flask_app.py
+import os
+import requests
+import openai
+import boto3
+from twilio.rest import Client
+from gtts import gTTS
+import tempfile
+from flask import jsonify
+
+# env/config
+TWILIO_SID = os.environ.get("TWILIO_SID")
+TWILIO_TOKEN = os.environ.get("TWILIO_TOKEN")
+OPENAI_KEY = os.environ.get("OPENAI_KEY")
+S3_BUCKET = os.environ.get("S3_BUCKET")  # bucket must be public-read or use presigned URL
+AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+
+twilio_client = Client(TWILIO_SID, TWILIO_TOKEN)
+openai.api_key = OPENAI_KEY
+s3 = boto3.client("s3", region_name=AWS_REGION)
+
+# basic in-memory context per call (persist to DB later)
+CONTEXT = {}
+
+
 # Configure logging (stdout so Render captures it)
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -79,23 +104,108 @@ async def respond(payload: RespondRequest):
         # fail gracefully
         return RespondResponse(reply_text="[error]", used_script=True, next_state=0)
 
-# -------------------------
-# TwiML endpoint (returns TwiML with secure wss URL)
-# -------------------------
-@app.post("/twiml", response_class=Response)
-async def twiml():
-    token = os.getenv("TWILIO_STREAM_TOKEN", "axcydp34j7")
-    host = os.getenv("RENDER_EXTERNAL_HOSTNAME", "fl-ai-sales-agent3.onrender.com")
-    ws_url = f"wss://{host}/twilio/stream?token={token}"
-    twiml_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Start>
-    <Stream url="{ws_url}"/>
-  </Start>
-  <Say voice="alice">Hello — please hold while I connect you.</Say>
-  <Pause length="1"/>
-</Response>"""
-    return Response(content=twiml_xml, media_type="application/xml")
+@app.route("/recording", methods=["POST"])
+def recording():
+    """
+    Twilio will POST recording metadata here after each Record completes.
+    Fields include RecordingUrl, CallSid, etc.
+    """
+    recording_url = request.form.get("RecordingUrl")  # e.g. https://api.twilio.com/2010-04-01/...
+    call_sid = request.form.get("CallSid")
+    from_number = request.form.get("From")
+    to_number = request.form.get("To")
+
+    if not recording_url or not call_sid:
+        return ("Missing recording", 400)
+
+    # 1) download recording (mp3 or wav)
+    r = requests.get(recording_url + ".mp3")  # Twilio may require adding .mp3
+    if r.status_code != 200:
+        return ("Failed to download recording", 500)
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+    tmp.write(r.content)
+    tmp.flush()
+    tmp.close()
+
+    # 2) send to STT (OpenAI Whisper via /v1/audio/transcriptions)
+    transcript = transcribe_with_openai(tmp.name)
+
+    # 3) call OpenAI chat (maintain simple context)
+    ctx = CONTEXT.setdefault(call_sid, [{"role": "system", "content": "You are a friendly sales assistant."}])
+    ctx.append({"role": "user", "content": transcript})
+
+    chat_resp = openai.ChatCompletion.create(
+        model="gpt-4o-mini",  # or gpt-4o, gpt-4o-mini-instruct; choose your model
+        messages=ctx,
+        max_tokens=150
+    )
+    assistant_text = chat_resp["choices"][0]["message"]["content"].strip()
+    ctx.append({"role": "assistant", "content": assistant_text})
+
+    # 4) make TTS (quick prototype with gTTS) and upload to S3
+    tts_url = create_and_upload_tts(assistant_text)
+
+    # 5) instruct Twilio to play the audio into the active call by updating call TwiML
+    # Build TwiML to Play the TTS URL and then re-record (loop)
+    twiml = f"""<Response>
+        <Play>{tts_url}</Play>
+        <Record maxLength="5" action="{request.url_root}recording" playBeep="true" timeout="2"/>
+    </Response>"""
+
+    try:
+        twilio_client.calls(call_sid).update(twiml=twiml)
+    except Exception as e:
+        print("Twilio update failed:", e)
+
+    return jsonify({"transcript": transcript, "assistant": assistant_text})
+
+def transcribe_with_openai(file_path: str) -> str:
+    """
+    Use OpenAI Whisper API (speech-to-text batch).
+    """
+    with open(file_path, "rb") as f:
+        resp = openai.Audio.transcribe("gpt-4o-transcribe", file=f)  # or "whisper-1" depending on available models
+    return resp["text"].strip()
+
+def create_and_upload_tts(text: str) -> str:
+    """
+    Prototype: gTTS -> temporary mp3 -> upload to S3 -> return public URL.
+    Replace gTTS with ElevenLabs for better quality.
+    """
+    tts = gTTS(text=text, lang="en")
+    tmp_tts = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+    tmp_tts_name = tmp_tts.name
+    tmp_tts.close()
+    tts.save(tmp_tts_name)
+
+    key = f"tts/{os.path.basename(tmp_tts_name)}"
+    s3.upload_file(tmp_tts_name, S3_BUCKET, key, ExtraArgs={"ACL": "public-read", "ContentType": "audio/mpeg"})
+    url = f"https://{S3_BUCKET}.s3.amazonaws.com/{key}"
+    return url
+
+
+
+# flask_app.py (add or integrate into your app)
+from flask import Flask, request, Response, url_for
+from twilio.twiml.voice_response import VoiceResponse
+
+app = Flask(__name__)
+
+@app.route("/twiml", methods=["POST", "GET"])
+def twiml():
+    # This TwiML says a short intro then records up to 5s of user audio,
+    # then POSTs the recording to /recording for processing.
+    resp = VoiceResponse()
+
+    # 1) Play or Say your pre-trained marketing script (replace with your script)
+    resp.say("Hello, this is Acme sales. I'm calling to share a brief offer.", voice="alice")
+
+    # 2) Record user reply (short)
+    # action -> Twilio will POST recording details (RecordingUrl) to /recording
+    resp.record(max_length=5, action=url_for('recording', _external=True), play_beep=True, timeout=2)
+
+    # 3) Optionally hang up or loop back to record again after playing reply (we'll control later)
+    return Response(str(resp), mimetype="text/xml")
 
 # -------------------------
 # Placeholder STT and TTS functions (replace with real providers)
