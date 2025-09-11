@@ -117,15 +117,21 @@ async def respond(payload: RespondRequest):
 # Helper: build recording callback URL
 # -------------------------
 def recording_callback_url(request: Request) -> str:
-    # Prefer HOSTNAME env var for background tasks; else derive from request
-    host = HOSTNAME or request.url.hostname
-    scheme = request.url.scheme or "https"
+    """
+    Build absolute HTTPS recording callback URL.
+    Prefer HOSTNAME env var (recommended). If HOSTNAME is not set,
+    fallback to request.url but force https scheme.
+    """
+    host = HOSTNAME.strip() if HOSTNAME else None
     if host:
-        return f"{scheme}://{host}/recording"
-    else:
-        # fallback to request.base_url
-        base = str(request.base_url).rstrip("/")
-        return f"{base}/recording"
+        return f"https://{host}/recording"
+    # fallback: construct from request but force https
+    base = str(request.base_url).rstrip("/")
+    # request.base_url may contain http when behind proxies, so force https
+    if base.startswith("http://"):
+        base = "https://" + base.split("://", 1)[1]
+    return f"{base}/recording"
+
 
 # -------------------------
 # TwiML endpoint
