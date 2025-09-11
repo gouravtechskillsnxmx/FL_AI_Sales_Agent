@@ -199,6 +199,8 @@ async def recording(request: Request, background_tasks: BackgroundTasks):
     Twilio will POST recording metadata here after each Record completes.
     We respond immediately with 204 No Content and process the audio in background.
     """
+    logger.info("Twilio /recording POST payload: CallSid=%s RecordingUrl=%s", call_sid, recording_url)
+
     form = await request.form()
     recording_url = form.get("RecordingUrl")
     call_sid = form.get("CallSid")
