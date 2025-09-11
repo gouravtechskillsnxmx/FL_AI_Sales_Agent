@@ -26,7 +26,7 @@ from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 
 import requests
-#import openai
+import openai
 import boto3
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse
