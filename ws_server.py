@@ -340,42 +340,41 @@ def transcribe_with_openai(file_path: str) -> str:
         raise
 
 
-def create_and_upload_tts(text: str, expires_in: int = 120) -> str:
+def create_and_upload_tts(text: str, expires_in: int = 600) -> str:
     """
-    Create TTS (gTTS prototyping) -> upload to S3 WITHOUT ACL -> return presigned GET URL.
-    Twilio can fetch the presigned URL (HTTPS) to play the audio.
+    Create TTS, upload without ACL, return a presigned GET URL valid for `expires_in` seconds.
+    Default expiry increased to 600s (10 minutes) to avoid Twilio timing issues.
     """
-    # create mp3 locally
-    tts = gTTS(text=text, lang="en")
-    tmp_tts = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-    tmp_tts_name = tmp_tts.name
-    tmp_tts.close()
-    tts.save(tmp_tts_name)
+    from gtts import gTTS
+    import tempfile, os, logging
 
-    # build key and upload WITHOUT ACL (buckets with ACLs disabled reject ACL requests)
-    key = f"tts/{os.path.basename(tmp_tts_name)}"
+    # 1) Create temp MP3
+    tts = gTTS(text=text, lang="en")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+    tmp_name = tmp.name
+    tmp.close()
+    tts.save(tmp_name)
+
+    # 2) Upload WITHOUT ACL (buckets with ACLs disabled)
+    key = f"tts/{os.path.basename(tmp_name)}"
     try:
-        s3.upload_file(
-            tmp_tts_name,
-            S3_BUCKET,
-            key,
-            ExtraArgs={"ContentType": "audio/mpeg"}  # no ACL here
-        )
-    except Exception as e:
-        logger.exception("Failed to upload %s to %s/%s: %s", tmp_tts_name, S3_BUCKET, key, e)
+        s3.upload_file(tmp_name, S3_BUCKET, key, ExtraArgs={"ContentType": "audio/mpeg"})
+    except Exception:
+        logger.exception("Failed to upload %s to %s/%s", tmp_name, S3_BUCKET, key)
         raise
 
-    # generate a presigned GET URL so Twilio can fetch it securely
+    # 3) Generate presigned GET URL with longer expiry
     try:
         presigned = s3.generate_presigned_url(
             ClientMethod='get_object',
             Params={'Bucket': S3_BUCKET, 'Key': key},
-            ExpiresIn=expires_in
+            ExpiresIn=expires_in  # seconds
         )
+        logger.info("Generated presigned TTS URL (expires in %s s): %s", expires_in, presigned)
         return presigned
-    except Exception as e:
-        logger.exception("Failed to create presigned URL for %s/%s: %s", S3_BUCKET, key, e)
-        # As a fallback, return the object URL (works only if bucket/object is public)
+    except Exception:
+        logger.exception("Failed to create presigned URL for %s/%s", S3_BUCKET, key)
+        # fallback (may be private so Twilio could fail)
         return f"https://{S3_BUCKET}.s3.amazonaws.com/{key}"
 
 # -------------------------
