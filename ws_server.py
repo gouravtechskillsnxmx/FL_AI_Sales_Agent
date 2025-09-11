@@ -35,6 +35,33 @@ from fastapi import Response
 import requests
 from requests.auth import HTTPBasicAuth
 
+import time
+from urllib.parse import urlparse
+import requests
+from requests.auth import HTTPBasicAuth
+from requests.exceptions import RequestException, ConnectionError, HTTPError, Timeout
+
+AUDIO_EXTENSIONS = ('.mp3', '.wav', '.m4a', '.ogg', '.webm', '.flac')
+
+def build_download_url(recording_url: str) -> str:
+    """
+    Return a safe download URL.
+    If Twilio gives a base RecordingUrl (no extension), Twilio usually requires adding .mp3
+    however many external test URLs already include an extension; avoid double-appending.
+    """
+    if not recording_url:
+        return recording_url
+    parsed = urlparse(recording_url)
+    path = parsed.path.lower()
+    # If path already ends with an audio extension, leave it
+    if any(path.endswith(ext) for ext in AUDIO_EXTENSIONS):
+        return recording_url
+    # Otherwise, default to appending .mp3 (Twilio recording URLs often require this)
+    return recording_url + ".mp3"
+
+
+
+
 # ---------------- env/config ----------------
 TWILIO_SID = os.environ.get("TWILIO_SID")
 TWILIO_TOKEN = os.environ.get("TWILIO_TOKEN")
@@ -191,37 +218,53 @@ async def recording(request: Request, background_tasks: BackgroundTasks):
 # Background processing pipeline
 # -------------------------
 async def process_recording_background(call_sid: str, recording_url: str):
-    """
-    Background pipeline:
-      - download recording (requires Twilio basic auth)
-      - transcribe (STT)
-      - call agent -> get assistant_text
-      - create TTS -> upload -> get public URL
-      - instruct Twilio to play audio into call (calls.update)
-    """
     try:
         logger.info("[%s] downloading recording: %s", call_sid, recording_url)
-        download_url = recording_url + ".mp3"
-        # Use Basic Auth with Twilio Account SID and Auth Token
+        download_url = build_download_url(recording_url)
+
+        # Ensure we have Twilio credentials for auth when fetching Twilio-hosted recordings
         if not (TWILIO_SID and TWILIO_TOKEN):
-            logger.error("TWILIO_SID or TWILIO_TOKEN not set; cannot download recording.")
+            logger.warning("[%s] TWILIO_SID/TWILIO_TOKEN not set; will try unauthenticated download.", call_sid)
+
+        # Try a few retries for transient DNS issues
+        max_retries = 3
+        backoff = 1.0
+        resp = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                auth = HTTPBasicAuth(TWILIO_SID, TWILIO_TOKEN) if (TWILIO_SID and TWILIO_TOKEN) else None
+                resp = requests.get(download_url, auth=auth, timeout=15)
+                resp.raise_for_status()
+                break
+            except RequestException as e:
+                # If this is a DNS / name resolution issue, log specifically and don't retry many times
+                if isinstance(e, ConnectionError) and getattr(e, "args", None):
+                    err_str = str(e)
+                    if "Name or service not known" in err_str or "Failed to resolve" in err_str:
+                        logger.error("[%s] Name resolution failed for host in URL '%s': %s", call_sid, download_url, err_str)
+                        # No point retrying if DNS can't resolve - break and abort
+                        resp = None
+                        break
+                # For other transient errors we retry a couple times
+                logger.warning("[%s] download attempt %d failed for %s: %s", call_sid, attempt, download_url, e)
+                if attempt < max_retries:
+                    time.sleep(backoff)
+                    backoff *= 2
+                else:
+                    resp = None
+
+        if resp is None:
+            logger.error("[%s] Failed to download recording after %d attempts: %s", call_sid, max_retries, download_url)
             return
 
-        # include auth here to avoid 401
-        r = requests.get(download_url, auth=HTTPBasicAuth(TWILIO_SID, TWILIO_TOKEN), timeout=30)
-        try:
-            r.raise_for_status()
-        except requests.exceptions.HTTPError as e:
-            logger.exception("[%s] Failed to download recording: %s %s", call_sid, download_url, e)
-            return
-
+        # Save temp file
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-        tmp.write(r.content)
+        tmp.write(resp.content)
         tmp.flush()
         tmp.close()
         file_path = tmp.name
 
-        # STT (blocking) - run in executor if long; here it's synchronous
+        # STT
         transcript = transcribe_with_openai(file_path)
         logger.info("[%s] transcript: %s", call_sid, transcript)
 
@@ -236,28 +279,22 @@ async def process_recording_background(call_sid: str, recording_url: str):
         if not assistant_text:
             assistant_text = "Sorry, I couldn't understand. Could you repeat that?"
 
-        # TTS -> upload
+        # TTS -> upload (presigned URL approach)
         tts_url = create_and_upload_tts(assistant_text)
         logger.info("[%s] tts_url: %s", call_sid, tts_url)
 
-        # Build TwiML: play the TTS and then record again
-        # Use HOSTNAME env var if set to ensure https scheme
+        # Build TwiML and update call
         if HOSTNAME:
             record_action = f"https://{HOSTNAME}/recording"
         else:
-            # fallback to Twilio-safe default: use https and your domain if not known
-            record_action = f"https://{request_host_for_background()}/recording" if 'request_host_for_background' in globals() else f"/recording"
-
+            record_action = f"/recording"
         twiml = f"""<Response>
             <Play>{tts_url}</Play>
             <Record maxLength="5" action="{record_action}" playBeep="true" timeout="2"/>
         </Response>"""
-
         try:
             if twilio_client:
                 twilio_client.calls(call_sid).update(twiml=twiml)
-            else:
-                logger.warning("[%s] Twilio client not configured; cannot update call", call_sid)
         except Exception as e:
             logger.exception("[%s] Error updating Twilio call: %s", call_sid, e)
 
