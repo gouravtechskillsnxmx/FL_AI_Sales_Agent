@@ -38,6 +38,12 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi import Query
 from fastapi.responses import StreamingResponse
 
+import time
+from urllib.parse import urlparse, quote_plus
+from requests.auth import HTTPBasicAuth
+from requests.exceptions import RequestException, ConnectionError
+
+
 
 AUDIO_EXTENSIONS = ('.mp3', '.wav', '.m4a', '.ogg', '.webm', '.flac')
 
@@ -259,38 +265,47 @@ async def recording(request: Request, background_tasks: BackgroundTasks):
 # -------------------------
 # Background processing pipeline
 # -------------------------
+
 async def process_recording_background(
     call_sid: str,
     recording_url: str | None = None,
     recording_sid: str | None = None,
     payload: dict | None = None
 ):
+    """
+    Robust background pipeline:
+      1) download Twilio recording (with auth when needed)
+      2) transcribe via OpenAI (transcribe_with_openai)
+      3) call agent (process_user_text)
+      4) create TTS file and upload to S3 (create_and_upload_tts)
+      5) send Twilio TwiML pointing at /tts-proxy?key=...
+      6) fallback to <Say> on any failure so caller doesn't hear generic app error
+    """
     try:
-        logger.info("[%s] downloading recording: %s", call_sid, recording_url)
+        logger.info("[%s] background job started. recording_url=%s recording_sid=%s", call_sid, recording_url, recording_sid)
+
+        # Build download URL (your helper)
         download_url = build_download_url(recording_url)
+        auth = HTTPBasicAuth(TWILIO_SID, TWILIO_TOKEN) if (TWILIO_SID and TWILIO_TOKEN and "api.twilio.com" in (download_url or "")) else None
 
-        # Ensure we have Twilio credentials for auth when fetching Twilio-hosted recordings
-        if not (TWILIO_SID and TWILIO_TOKEN):
-            logger.warning("[%s] TWILIO_SID/TWILIO_TOKEN not set; will try unauthenticated download.", call_sid)
-
-        # Try a few retries for transient DNS issues
+        # Download with retries
+        resp = None
         max_retries = 3
         backoff = 1.0
-        resp = None
         for attempt in range(1, max_retries + 1):
             try:
-                auth = HTTPBasicAuth(TWILIO_SID, TWILIO_TOKEN) if (TWILIO_SID and TWILIO_TOKEN) else None
-                resp = requests.get(download_url, auth=auth, timeout=15)
-                resp.raise_for_status()
+                logger.info("[%s] attempting download (attempt %d): %s (auth=%s)", call_sid, attempt, download_url, bool(auth))
+                r = requests.get(download_url, auth=auth, timeout=20)
+                r.raise_for_status()
+                resp = r
                 break
             except RequestException as e:
-                if isinstance(e, ConnectionError) and getattr(e, "args", None):
-                    err_str = str(e)
-                    if "Name or service not known" in err_str or "Failed to resolve" in err_str:
-                        logger.error("[%s] Name resolution failed for host in URL '%s': %s", call_sid, download_url, err_str)
-                        resp = None
-                        break
-                logger.warning("[%s] download attempt %d failed for %s: %s", call_sid, attempt, download_url, e)
+                # DNS-like fatal
+                if isinstance(e, ConnectionError) and ("Failed to resolve" in str(e) or "Name or service not known" in str(e)):
+                    logger.error("[%s] name resolution error for %s: %s", call_sid, download_url, e)
+                    resp = None
+                    break
+                logger.warning("[%s] download attempt %d failed: %s", call_sid, attempt, e)
                 if attempt < max_retries:
                     time.sleep(backoff)
                     backoff *= 2
@@ -298,63 +313,93 @@ async def process_recording_background(
                     resp = None
 
         if resp is None:
-            logger.error("[%s] Failed to download recording after %d attempts: %s", call_sid, max_retries, download_url)
+            logger.error("[%s] failed to download recording; sending apology and exiting", call_sid)
+            fallback = "<Response><Say>Sorry, I couldn't record your response. Please try again later.</Say></Response>"
+            try:
+                if twilio_client:
+                    twilio_client.calls(call_sid).update(twiml=fallback)
+            except Exception:
+                logger.exception("[%s] failed to send fallback TwiML", call_sid)
             return
 
-        # Save temp file
+        # Save recording to tmp file
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
         tmp.write(resp.content)
         tmp.flush()
         tmp.close()
         file_path = tmp.name
+        logger.info("[%s] saved recording to %s", call_sid, file_path)
 
-        # STT
-        transcript = transcribe_with_openai(file_path)
-        logger.info("[%s] transcript: %s", call_sid, transcript)
+        # STT: transcribe_with_openai(file_path) -> returns text
+        try:
+            transcript = transcribe_with_openai(file_path)
+            logger.info("[%s] transcript: %s", call_sid, transcript)
+        except Exception:
+            logger.exception("[%s] transcribe_with_openai failed", call_sid)
+            transcript = ""
 
-        # call the agent (sync or async)
-        if asyncio.iscoroutinefunction(process_user_text):
-            result = await process_user_text("default", call_sid, transcript)
-        else:
-            loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(None, lambda: process_user_text("default", call_sid, transcript))
+        # Agent: process_user_text -> returns dict or string
+        try:
+            if asyncio.iscoroutinefunction(process_user_text):
+                result = await process_user_text("default", call_sid, transcript)
+            else:
+                loop = asyncio.get_running_loop()
+                result = await loop.run_in_executor(None, lambda: process_user_text("default", call_sid, transcript))
+        except Exception:
+            logger.exception("[%s] process_user_text failed", call_sid)
+            result = {}
 
-        assistant_text = result.get("reply_text") if isinstance(result, dict) else str(result)
+        assistant_text = result.get("reply_text") if isinstance(result, dict) else (str(result) if result is not None else "")
         if not assistant_text:
-            assistant_text = "Sorry, I couldn't understand. Could you repeat that?"
+            assistant_text = "Sorry, I'm having trouble answering right now."
 
-        # TTS -> upload (to S3, but we’ll proxy it)
-        tts_url = create_and_upload_tts(assistant_text)
-        logger.info("[%s] raw S3 tts_url: %s", call_sid, tts_url)
+        # TTS: create_and_upload_tts should upload the MP3 to S3 and return the S3 URL (not required presigned).
+        try:
+            tts_s3_url = create_and_upload_tts(assistant_text)  # must return e.g. https://bucket.s3.amazonaws.com/tts/tmp....mp3
+            logger.info("[%s] create_and_upload_tts returned: %s", call_sid, tts_s3_url)
+        except Exception:
+            logger.exception("[%s] create_and_upload_tts failed", call_sid)
+            tts_s3_url = None
 
-        # Extract object key from S3 URL (everything after the bucket host)
-        from urllib.parse import urlparse
-        key = urlparse(tts_url).path.lstrip("/")  # e.g. "tts/tmp123.mp3"
+        if not tts_s3_url:
+            fallback = "<Response><Say>Sorry, I'm unable to prepare a reply right now.</Say></Response>"
+            try:
+                if twilio_client:
+                    twilio_client.calls(call_sid).update(twiml=fallback)
+            except Exception:
+                logger.exception("[%s] failed to send fallback TwiML (no tts)", call_sid)
+            return
 
-        # Build proxy URL
+        # Extract S3 key and build proxy URL (URL-encode key)
+        parsed = urlparse(tts_s3_url)
+        s3_key = parsed.path.lstrip("/")  # e.g. "tts/tmpabc.mp3"
+        proxy_key = quote_plus(s3_key)
         if HOSTNAME:
-            proxy_url = f"https://{HOSTNAME}/tts-proxy?key={key}"
-        else:
-            proxy_url = f"/tts-proxy?key={key}"
-        logger.info("[%s] proxy_url for Twilio: %s", call_sid, proxy_url)
-
-        # Build TwiML using proxy URL
-        if HOSTNAME:
+            proxy_url = f"https://{HOSTNAME}/tts-proxy?key={proxy_key}"
             record_action = f"https://{HOSTNAME}/recording"
         else:
-            record_action = f"/recording"
+            proxy_url = f"/tts-proxy?key={proxy_key}"
+            record_action = "/recording"
 
+        # Build TwiML using proxy_url
         twiml = f"""<Response>
             <Play>{proxy_url}</Play>
-            <Record maxLength="5" action="{record_action}" playBeep="true" timeout="2"/>
+            <Record maxLength="10" action="{record_action}" playBeep="true" timeout="2"/>
         </Response>"""
+        logger.info("[%s] updating Twilio with TwiML (proxy): %s", call_sid, twiml)
 
         try:
             if twilio_client:
                 twilio_client.calls(call_sid).update(twiml=twiml)
-                logger.info("[%s] Updated Twilio call with TwiML", call_sid)
-        except Exception as e:
-            logger.exception("[%s] Error updating Twilio call: %s", call_sid, e)
+                logger.info("[%s] Twilio update with proxy succeeded", call_sid)
+        except Exception:
+            logger.exception("[%s] Twilio update with proxy failed; attempting fallback Say", call_sid)
+            try:
+                fallback = "<Response><Say>Sorry, I couldn't play the response. Please try again later.</Say></Response>"
+                if twilio_client:
+                    twilio_client.calls(call_sid).update(twiml=fallback)
+            except Exception:
+                logger.exception("[%s] sending fallback also failed", call_sid)
 
     except Exception as e:
         logger.exception("[%s] Unexpected error in process_recording_background: %s", call_sid, e)
