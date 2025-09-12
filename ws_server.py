@@ -193,28 +193,44 @@ async def twiml(request: Request):
 # Recording webhook (Twilio posts after a Record completes)
 # -------------------------
 @app.post("/recording")
+# Replace your existing /recording handler with this safe version
+from fastapi import Response
+
 @app.post("/recording")
 async def recording(request: Request, background_tasks: BackgroundTasks):
     """
     Twilio will POST recording metadata here after each Record completes.
-    We respond immediately with 204 No Content and process the audio in background.
+    We log the full payload, validate required fields, ack quickly (204),
+    and schedule background processing for valid inputs.
     """
-    logger.info("Twilio /recording POST payload: CallSid=%s RecordingUrl=%s", call_sid, recording_url)
+    # read form data first and make sure variables are always defined
+    try:
+        form = await request.form()
+        payload = dict(form)
+    except Exception as e:
+        logger.exception("Failed to parse form in /recording: %s", e)
+        return JSONResponse({"error": "invalid_form"}, status_code=400)
 
-    form = await request.form()
-    recording_url = form.get("RecordingUrl")
-    call_sid = form.get("CallSid")
-    from_number = form.get("From")
-    to_number = form.get("To")
+    # pull fields safely
+    recording_url = payload.get("RecordingUrl") or payload.get("recordingurl")
+    recording_sid = payload.get("RecordingSid") or payload.get("recordingsid")
+    call_sid = payload.get("CallSid") or payload.get("callsid")
+    from_number = payload.get("From")
+    to_number = payload.get("To")
 
-    if not recording_url or not call_sid:
-        logger.warning("Missing RecordingUrl or CallSid in /recording payload: %s", dict(form))
-        return JSONResponse({"error": "missing RecordingUrl or CallSid"}, status_code=400)
+    # log the raw payload for debugging (but avoid logging secrets)
+    logger.info("Twilio /recording webhook payload: %s", payload)
 
-    # enqueue background processing (fast ack)
-    background_tasks.add_task(process_recording_background, call_sid, recording_url)
-    # important: return an empty 204 (no body/content-length)
+    # validate minimum required fields
+    if not call_sid:
+        logger.warning("/recording missing CallSid; payload: %s", payload)
+        # Twilio expects a 200/204 quickly. Return 400 so you can see error clearly during tests.
+        return JSONResponse({"error": "missing CallSid"}, status_code=400)
+
+    # schedule background processing and ack immediately
+    background_tasks.add_task(process_recording_background, call_sid, recording_url, recording_sid, payload)
     return Response(status_code=204)
+
 
 # -------------------------
 # Background processing pipeline
