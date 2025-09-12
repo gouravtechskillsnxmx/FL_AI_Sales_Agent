@@ -387,42 +387,32 @@ def transcribe_with_openai(file_path: str) -> str:
         raise
 
 
-def create_and_upload_tts(text: str, expires_in: int = 600) -> str:
+def create_and_upload_tts(text: str, expires_in: int = 3600) -> str:
     """
-    Create TTS, upload without ACL, return a presigned GET URL valid for `expires_in` seconds.
-    Default expiry increased to 600s (10 minutes) to avoid Twilio timing issues.
+    Create TTS, upload to S3 with proper ContentType, and return a presigned URL
+    valid for expires_in seconds (default 1 hour).
     """
+    import os, tempfile
     from gtts import gTTS
-    import tempfile, os, logging
 
-    # 1) Create temp MP3
-    tts = gTTS(text=text, lang="en")
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
     tmp_name = tmp.name
     tmp.close()
-    tts.save(tmp_name)
+    gTTS(text=text, lang="en").save(tmp_name)
 
-    # 2) Upload WITHOUT ACL (buckets with ACLs disabled)
     key = f"tts/{os.path.basename(tmp_name)}"
-    try:
-        s3.upload_file(tmp_name, S3_BUCKET, key, ExtraArgs={"ContentType": "audio/mpeg"})
-    except Exception:
-        logger.exception("Failed to upload %s to %s/%s", tmp_name, S3_BUCKET, key)
-        raise
+    # Upload with explicit ContentType
+    s3.upload_file(tmp_name, S3_BUCKET, key, ExtraArgs={"ContentType": "audio/mpeg"})
+    logger.info("Uploaded TTS to s3://%s/%s", S3_BUCKET, key)
 
-    # 3) Generate presigned GET URL with longer expiry
-    try:
-        presigned = s3.generate_presigned_url(
-            ClientMethod='get_object',
-            Params={'Bucket': S3_BUCKET, 'Key': key},
-            ExpiresIn=expires_in  # seconds
-        )
-        logger.info("Generated presigned TTS URL (expires in %s s): %s", expires_in, presigned)
-        return presigned
-    except Exception:
-        logger.exception("Failed to create presigned URL for %s/%s", S3_BUCKET, key)
-        # fallback (may be private so Twilio could fail)
-        return f"https://{S3_BUCKET}.s3.amazonaws.com/{key}"
+    # Generate presigned URL with longer expiry
+    presigned = s3.generate_presigned_url(
+        ClientMethod='get_object',
+        Params={'Bucket': S3_BUCKET, 'Key': key},
+        ExpiresIn=expires_in
+    )
+    logger.info("Generated presigned TTS URL (expires_in=%s): %s", expires_in, presigned)
+    return presigned
 
 # -------------------------
 # (Optional) Twilio Media Streams WebSocket handler (kept as example)
