@@ -224,7 +224,12 @@ async def recording(request: Request, background_tasks: BackgroundTasks):
 # -------------------------
 # Background processing pipeline
 # -------------------------
-async def process_recording_background(call_sid: str, recording_url: str):
+async def process_recording_background(
+    call_sid: str,
+    recording_url: str | None = None,
+    recording_sid: str | None = None,
+    payload: dict | None = None
+):
     try:
         logger.info("[%s] downloading recording: %s", call_sid, recording_url)
         download_url = build_download_url(recording_url)
