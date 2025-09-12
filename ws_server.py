@@ -36,7 +36,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 # Temporary debug endpoint — add to ws_server.py and redeploy, then call /debug/s3check?key=tts/<filename>
 from fastapi import Query
-
+from fastapi.responses import StreamingResponse
 
 
 AUDIO_EXTENSIONS = ('.mp3', '.wav', '.m4a', '.ogg', '.webm', '.flac')
@@ -284,15 +284,12 @@ async def process_recording_background(
                 resp.raise_for_status()
                 break
             except RequestException as e:
-                # If this is a DNS / name resolution issue, log specifically and don't retry many times
                 if isinstance(e, ConnectionError) and getattr(e, "args", None):
                     err_str = str(e)
                     if "Name or service not known" in err_str or "Failed to resolve" in err_str:
                         logger.error("[%s] Name resolution failed for host in URL '%s': %s", call_sid, download_url, err_str)
-                        # No point retrying if DNS can't resolve - break and abort
                         resp = None
                         break
-                # For other transient errors we retry a couple times
                 logger.warning("[%s] download attempt %d failed for %s: %s", call_sid, attempt, download_url, e)
                 if attempt < max_retries:
                     time.sleep(backoff)
@@ -326,22 +323,36 @@ async def process_recording_background(
         if not assistant_text:
             assistant_text = "Sorry, I couldn't understand. Could you repeat that?"
 
-        # TTS -> upload (presigned URL approach)
+        # TTS -> upload (to S3, but we’ll proxy it)
         tts_url = create_and_upload_tts(assistant_text)
-        logger.info("[%s] tts_url: %s", call_sid, tts_url)
+        logger.info("[%s] raw S3 tts_url: %s", call_sid, tts_url)
 
-        # Build TwiML and update call
+        # Extract object key from S3 URL (everything after the bucket host)
+        from urllib.parse import urlparse
+        key = urlparse(tts_url).path.lstrip("/")  # e.g. "tts/tmp123.mp3"
+
+        # Build proxy URL
+        if HOSTNAME:
+            proxy_url = f"https://{HOSTNAME}/tts-proxy?key={key}"
+        else:
+            proxy_url = f"/tts-proxy?key={key}"
+        logger.info("[%s] proxy_url for Twilio: %s", call_sid, proxy_url)
+
+        # Build TwiML using proxy URL
         if HOSTNAME:
             record_action = f"https://{HOSTNAME}/recording"
         else:
             record_action = f"/recording"
+
         twiml = f"""<Response>
-            <Play>{tts_url}</Play>
+            <Play>{proxy_url}</Play>
             <Record maxLength="5" action="{record_action}" playBeep="true" timeout="2"/>
         </Response>"""
+
         try:
             if twilio_client:
                 twilio_client.calls(call_sid).update(twiml=twiml)
+                logger.info("[%s] Updated Twilio call with TwiML", call_sid)
         except Exception as e:
             logger.exception("[%s] Error updating Twilio call: %s", call_sid, e)
 
@@ -413,6 +424,22 @@ def create_and_upload_tts(text: str, expires_in: int = 3600) -> str:
     )
     logger.info("Generated presigned TTS URL (expires_in=%s): %s", expires_in, presigned)
     return presigned
+
+
+@app.get("/tts-proxy")
+def tts_proxy(key: str):
+    # basic validation
+    if not key or ".." in key or key.startswith("/"):
+        return JSONResponse({"error":"invalid_key"}, status_code=400)
+    try:
+        meta = s3.head_object(Bucket=S3_BUCKET, Key=key)
+        obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
+        body_stream = obj['Body']
+        content_type = meta.get("ContentType", "audio/mpeg")
+        return StreamingResponse(body_stream, media_type=content_type)
+    except Exception as e:
+        logger.exception("tts-proxy failed for key=%s: %s", key, e)
+        return JSONResponse({"error":"tts_proxy_failed", "detail": str(e)}, status_code=500)
 
 # -------------------------
 # (Optional) Twilio Media Streams WebSocket handler (kept as example)
