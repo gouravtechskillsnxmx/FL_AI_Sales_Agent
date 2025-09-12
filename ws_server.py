@@ -17,29 +17,22 @@ import base64
 import logging
 import tempfile
 import asyncio
+from urllib.parse import urlparse, parse_qs
 
-from urllib.parse import parse_qs
+import requests
+from requests.auth import HTTPBasicAuth
+from requests.exceptions import RequestException, ConnectionError, HTTPError, Timeout
+
+import openai
+import boto3
+from gtts import gTTS
+from twilio.rest import Client
+from twilio.twiml.voice_response import VoiceResponse
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response, BackgroundTasks
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
-
-import requests
-import openai
-import boto3
-from twilio.rest import Client
-from twilio.twiml.voice_response import VoiceResponse
-from gtts import gTTS
-from fastapi import Response
-import requests
-from requests.auth import HTTPBasicAuth
-
-import time
-from urllib.parse import urlparse
-import requests
-from requests.auth import HTTPBasicAuth
-from requests.exceptions import RequestException, ConnectionError, HTTPError, Timeout
 
 AUDIO_EXTENSIONS = ('.mp3', '.wav', '.m4a', '.ogg', '.webm', '.flac')
 
@@ -193,10 +186,6 @@ async def twiml(request: Request):
 # Recording webhook (Twilio posts after a Record completes)
 # -------------------------
 @app.post("/recording")
-# Replace your existing /recording handler with this safe version
-from fastapi import Response
-
-@app.post("/recording")
 async def recording(request: Request, background_tasks: BackgroundTasks):
     """
     Twilio will POST recording metadata here after each Record completes.
@@ -224,7 +213,7 @@ async def recording(request: Request, background_tasks: BackgroundTasks):
     # validate minimum required fields
     if not call_sid:
         logger.warning("/recording missing CallSid; payload: %s", payload)
-        # Twilio expects a 200/204 quickly. Return 400 so you can see error clearly during tests.
+        # Return a 400 during debugging; change to 204 to avoid Twilio retry in production if desired.
         return JSONResponse({"error": "missing CallSid"}, status_code=400)
 
     # schedule background processing and ack immediately
