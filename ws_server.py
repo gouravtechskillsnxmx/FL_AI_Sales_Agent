@@ -34,6 +34,39 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 
+# Temporary debug endpoint — add to ws_server.py and redeploy, then call /debug/s3check?key=tts/<filename>
+from fastapi import Query
+
+@app.get("/debug/s3check")
+def debug_s3_check(key: str = Query(..., description="S3 object key, e.g. tts/tmpxxxx.mp3")):
+    """
+    Returns head_object metadata, tries to get_object, and returns a presigned URL.
+    Only use temporarily for debugging.
+    """
+    try:
+        # assumes `s3` boto3 client is already created with the app's env creds
+        meta = s3.head_object(Bucket=S3_BUCKET, Key=key)
+        presigned = s3.generate_presigned_url(
+            ClientMethod="get_object",
+            Params={"Bucket": S3_BUCKET, "Key": key},
+            ExpiresIn=600
+        )
+        # try a minimal get_object to check permission (do NOT return full bytes)
+        got = s3.get_object(Bucket=S3_BUCKET, Key=key)
+        length = got.get("ContentLength")
+        ct = meta.get("ContentType")
+        return {
+            "status": "ok",
+            "head_object": {"ContentType": ct, "ContentLength": length},
+            "presigned_url": presigned
+        }
+    except Exception as e:
+        # return the exception text so we can see AWS error (AccessDenied, SignatureDoesNotMatch, etc)
+        import traceback
+        tb = traceback.format_exc()
+        return {"status": "error", "error": str(e), "trace": tb}
+
+
 AUDIO_EXTENSIONS = ('.mp3', '.wav', '.m4a', '.ogg', '.webm', '.flac')
 
 def build_download_url(recording_url: str) -> str:
