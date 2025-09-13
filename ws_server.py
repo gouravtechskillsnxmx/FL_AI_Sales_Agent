@@ -37,6 +37,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 # Temporary debug endpoint — add to ws_server.py and redeploy, then call /debug/s3check?key=tts/<filename>
 from fastapi import Query
 from fastapi.responses import StreamingResponse
+from fastapi.responses import Response
 
 import time
 from urllib.parse import urlparse, quote_plus
@@ -46,6 +47,10 @@ from requests.exceptions import RequestException, ConnectionError
 
 
 AUDIO_EXTENSIONS = ('.mp3', '.wav', '.m4a', '.ogg', '.webm', '.flac')
+
+
+def make_twiml_response(twiml: str) -> Response:
+    return Response(content=twiml.strip(), media_type="application/xml")
 
 def build_download_url(recording_url: str) -> str:
     """
@@ -226,12 +231,23 @@ async def twiml(request: Request):
 # -------------------------
 # Recording webhook (Twilio posts after a Record completes)
 # -------------------------
+
+def make_twiml_response(twiml: str) -> Response:
+    """
+    Return TwiML with the exact content-type Twilio expects.
+    Use this when you want to return TwiML XML immediately.
+    """
+    return Response(content=twiml.strip(), media_type="application/xml")
+
 @app.post("/recording")
 async def recording(request: Request, background_tasks: BackgroundTasks):
     """
-    Twilio will POST recording metadata here after each Record completes.
-    We log the full payload, validate required fields, ack quickly (204),
-    and schedule background processing for valid inputs.
+    Twilio POSTs recording metadata here after each <Record> completes.
+    We:
+      - parse and log the full payload,
+      - validate minimal fields,
+      - enqueue background processing, and
+      - ACK quickly with 204 (or return TwiML when helpful).
     """
     # read form data first and make sure variables are always defined
     try:
@@ -239,26 +255,33 @@ async def recording(request: Request, background_tasks: BackgroundTasks):
         payload = dict(form)
     except Exception as e:
         logger.exception("Failed to parse form in /recording: %s", e)
-        return JSONResponse({"error": "invalid_form"}, status_code=400)
+        # return TwiML apology so Twilio receives application/xml (helps avoid 12300)
+        return make_twiml_response("<Response><Say>Invalid request received.</Say></Response>")
 
-    # pull fields safely
+    # pull fields safely (support various casings)
     recording_url = payload.get("RecordingUrl") or payload.get("recordingurl")
     recording_sid = payload.get("RecordingSid") or payload.get("recordingsid")
     call_sid = payload.get("CallSid") or payload.get("callsid")
     from_number = payload.get("From")
     to_number = payload.get("To")
 
-    # log the raw payload for debugging (but avoid logging secrets)
     logger.info("Twilio /recording webhook payload: %s", payload)
 
-    # validate minimum required fields
+    # If CallSid missing, return TwiML so Twilio sees a proper XML response (and won't treat it as an app error)
     if not call_sid:
         logger.warning("/recording missing CallSid; payload: %s", payload)
-        # Return a 400 during debugging; change to 204 to avoid Twilio retry in production if desired.
-        return JSONResponse({"error": "missing CallSid"}, status_code=400)
+        return make_twiml_response("<Response><Say>Missing CallSid in webhook.</Say></Response>")
 
-    # schedule background processing and ack immediately
+    # If RecordingUrl missing, still ack but inform caller (optional)
+    if not recording_url:
+        logger.warning("[%s] /recording missing RecordingUrl; payload: %s", call_sid, payload)
+        # ACK quickly, but respond with TwiML to be explicit
+        background_tasks.add_task(process_recording_background, call_sid, recording_url, recording_sid, payload)
+        return make_twiml_response("<Response><Say>We did not receive any audio. Please try again.</Say></Response>")
+
+    # schedule background processing and ack immediately (204 No Content)
     background_tasks.add_task(process_recording_background, call_sid, recording_url, recording_sid, payload)
+    # A 204 is fine here — Twilio will treat it as success. It has no body, so no Content-Type is required.
     return Response(status_code=204)
 
 
