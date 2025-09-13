@@ -65,6 +65,121 @@ if OPENAI_KEY:
 
 # --- Helper functions ---
 
+# --- Safe testing stubs and call-status guarded update for process_recording_background ---
+
+# 1) Safe transcribe stub (define only if missing)
+if "transcribe_with_openai" not in globals():
+    def transcribe_with_openai(audio_path: str) -> str:
+        """
+        Temporary safe stub for transcription.
+        Replace with your production transcription using OpenAI whisper or other STT.
+        For now returns empty string (meaning 'no transcript') and logs the event.
+        """
+        try:
+            logger.info("transcribe_with_openai: stub used for file=%s", audio_path)
+            # Optionally: if you want basic local transcription for quick tests,
+            # integrate a lightweight STT here, otherwise return empty.
+            return ""  # empty transcript -> agent fallback will be used
+        except Exception as e:
+            logger.exception("transcribe_with_openai (stub) failed: %s", e)
+            return ""
+
+# 2) Safe process_user_text stub (define only if missing)
+if "process_user_text" not in globals():
+    def process_user_text(model_name: str, call_sid: str, user_text: str) -> dict:
+        """
+        Temporary stub for agent processing.
+        Replace with your langchain/agent call to produce a reply and optional metadata.
+        Returns a dict with "reply_text".
+        """
+        logger.info("process_user_text (stub) called model=%s call_sid=%s user_text=%r", model_name, call_sid, user_text)
+        # Basic echo-ish reply for quick testing:
+        if not user_text or user_text.strip() == "":
+            # simulate inability to hear user
+            return {"reply_text": "Sorry, I had trouble hearing you. Could you repeat that?"}
+        else:
+            # simple canned answer (replace with GPT call)
+            return {"reply_text": f"I heard you say: {user_text}. Thanks for that."}
+
+# 3) Helper to check call status safely
+from twilio.base.exceptions import TwilioRestException
+
+def call_is_in_progress(call_sid: str) -> bool:
+    """
+    Return True if Twilio call resource is currently 'in-progress'.
+    If we cannot fetch the call, we return False.
+    """
+    if not twilio_client:
+        logger.warning("call_is_in_progress: no twilio_client available")
+        return False
+    try:
+        call = twilio_client.calls(call_sid).fetch()
+        status = getattr(call, "status", None)
+        logger.info("[%s] remote call status=%s", call_sid, status)
+        return status == "in-progress"
+    except TwilioRestException as e:
+        logger.warning("[%s] cannot fetch call status: %s", call_sid, e)
+        return False
+    except Exception:
+        logger.exception("[%s] unexpected error fetching call status", call_sid)
+        return False
+
+# 4) Update process_recording_background (only the update/redirect part) to check call status
+# If your file already contains process_recording_background, edit the section where you call
+# `twilio_client.calls(call_sid).update(twiml=twiml)` and replace it with the guarded version below.
+#
+# I'll provide a small helper function to perform a safe update with call-status check:
+
+def safe_update_call_with_twiml(call_sid: str, twiml: str) -> bool:
+    """
+    Try to update an in-progress call with new TwiML. Returns True if update succeeded.
+    If call is not in-progress, skip update and return False.
+    """
+    if not twilio_client:
+        logger.warning("[%s] safe_update_call_with_twiml: no twilio_client configured", call_sid)
+        return False
+
+    try:
+        # Avoid updating if call is not active/in-progress
+        if not call_is_in_progress(call_sid):
+            logger.info("[%s] skipping Twilio update because call is not in-progress.", call_sid)
+            return False
+
+        twilio_client.calls(call_sid).update(twiml=twiml)
+        logger.info("[%s] safe_update_call_with_twiml: update succeeded", call_sid)
+        return True
+    except TwilioRestException as e:
+        # If Twilio says call cannot be redirected, log and return False.
+        logger.warning("[%s] TwilioRestException while updating call: %s", call_sid, e)
+        return False
+    except Exception:
+        logger.exception("[%s] Unexpected error when updating Twilio call", call_sid)
+        return False
+
+# 5) Clean-up helper for temp files (optional)
+import os
+def safe_remove_file(path: str):
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        logger.exception("safe_remove_file failed for %s", path)
+
+# 6) Example: how to integrate into process_recording_background
+# Replace direct calls to `twilio_client.calls(call_sid).update(twiml=twiml)` with:
+#
+#     updated = safe_update_call_with_twiml(call_sid, twiml)
+#     if not updated:
+#         logger.info("[%s] not able to redirect call (skipped or failed)", call_sid)
+#
+# Also ensure you call safe_remove_file(file_path) after transcription/upload to avoid tmp accumulation.
+#
+# -------------------------------------------------------------------------
+# If you want, I can also produce a full patched copy of your process_recording_background
+# with these safe-update and cleanup changes included. Paste "patch process_recording_background"
+# if you'd like me to update that function for you automatically.
+
+
 def make_twiml_response(twiml: str) -> Response:
     """Return TwiML with Content-Type application/xml"""
     return Response(content=twiml.strip(), media_type="application/xml")
