@@ -1,13 +1,4 @@
-# ws_server_fixed.py
-# Consolidated, cleaned and patched version of your ws_server.py
-# Key changes made:
-# - Cleaned imports
-# - create_and_upload_tts now uploads to S3 and RETURNS THE S3 KEY (not a presigned URL)
-# - process_recording_background uses /tts-proxy (no presigned expiry issues)
-# - /twiml and /recording endpoints return application/xml TwiML where appropriate
-# - Added make_twiml_response helper
-# - Kept calls to transcribe_with_openai and process_user_text (assumed implemented elsewhere in your project)
-
+# ws_server.py (UPDATED)
 import os
 import sys
 import time
@@ -68,28 +59,96 @@ if TWILIO_SID and TWILIO_TOKEN:
     except Exception:
         logger.exception("Failed to init Twilio client")
 
-# OpenAI key setup (your environment may vary)
+# OpenAI key setup
 if OPENAI_KEY:
     openai.api_key = OPENAI_KEY
 
-# Helper: return TwiML with correct content-type
+# --- Helper functions ---
+
 def make_twiml_response(twiml: str) -> Response:
+    """Return TwiML with Content-Type application/xml"""
     return Response(content=twiml.strip(), media_type="application/xml")
 
-# Helper to build recording callback URL
+
 def recording_callback_url(request: Request) -> str:
-    # Use HOSTNAME env when available so Twilio can reach it externally
-    if HOSTNAME:
-        return f"https://{HOSTNAME}/recording"
-    # fallback to using the incoming Host header
-    host = request.headers.get("host")
-    scheme = request.url.scheme
-    if host:
-        return f"{scheme}://{host}/recording"
+    """
+    Build a full callback URL for /recording.
+    Prefer HOSTNAME env (external). Otherwise use incoming Host header or fallback.
+    """
+    try:
+        if HOSTNAME:
+            return f"https://{HOSTNAME}/recording"
+        host = request.headers.get("host")
+        scheme = request.url.scheme if hasattr(request, "url") else "https"
+        if host:
+            return f"{scheme}://{host}/recording"
+    except Exception:
+        pass
     return "/recording"
 
+
+def build_download_url(recording_url: str | None) -> str | None:
+    """
+    Normalize Twilio recording URLs for direct download.
+    Twilio provides a Recording resource URL, and the actual audio is at <url>.mp3
+    """
+    if not recording_url:
+        return None
+
+    recording_url = recording_url.strip()
+
+    # Already has extension
+    if recording_url.lower().endswith((".mp3", ".wav", ".ogg", ".m4a")):
+        return recording_url
+
+    try:
+        parsed = urlparse(recording_url)
+        host = (parsed.netloc or "").lower()
+        if "api.twilio.com" in host and "/Recordings/" in parsed.path:
+            return recording_url + ".mp3"
+    except Exception:
+        # fallback
+        return recording_url
+
+    return recording_url
+
+
+def create_and_upload_tts(text: str, prefix: str = "tts") -> str:
+    """
+    Create TTS MP3 (gTTS), upload to S3 under <prefix>/ and return the S3 object key.
+    Ensures ContentType: audio/mpeg is set on the uploaded object.
+    """
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+    tmp_name = tmp.name
+    tmp.close()
+
+    # create mp3 using gTTS
+    gTTS(text=text, lang="en").save(tmp_name)
+
+    key = f"{prefix}/{os.path.basename(tmp_name)}"
+    try:
+        s3.upload_file(tmp_name, S3_BUCKET, key, ExtraArgs={"ContentType": "audio/mpeg"})
+        logger.info("Uploaded TTS to s3://%s/%s", S3_BUCKET, key)
+    except Exception:
+        logger.exception("Failed to upload TTS to s3://%s/%s", S3_BUCKET, key)
+        raise
+    return key
+
+
+def make_proxy_url(s3_key: str) -> str:
+    """
+    Construct a /tts-proxy URL for Twilio to fetch audio via our app.
+    """
+    safe_key = quote_plus(s3_key)
+    if HOSTNAME:
+        return f"https://{HOSTNAME}/tts-proxy?key={safe_key}"
+    return f"/tts-proxy?key={safe_key}"
+
+# --- End helpers ---
+
+
 # --- Endpoints ---
-@app.api_route("/twiml", methods=["GET", "POST"])  # initial TwiML
+@app.api_route("/twiml", methods=["GET", "POST"])
 async def twiml(request: Request):
     logger.info("/twiml hit")
     resp = VoiceResponse()
@@ -122,7 +181,7 @@ async def recording(request: Request, background_tasks: BackgroundTasks):
 
     # schedule background processing and ack quickly
     background_tasks.add_task(process_recording_background, call_sid, recording_url, recording_sid, payload)
-    # Return 204 No Content (Twilio accepts this). No content-type required for 204.
+    # Return 204 No Content (Twilio accepts this)
     return Response(status_code=204)
 
 
@@ -140,25 +199,6 @@ def tts_proxy(key: str):
     except Exception as e:
         logger.exception("tts-proxy failed for key=%s: %s", key, e)
         return JSONResponse({"error":"tts_proxy_failed", "detail": str(e)}, status_code=500)
-
-# --- Helper: create_and_upload_tts (returns S3 key) ---
-def create_and_upload_tts(text: str, prefix: str = "tts") -> str:
-    """
-    Create TTS MP3 (gTTS), upload to S3 under tts/ and return the object key.
-    """
-    import os
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-    tmp_name = tmp.name
-    tmp.close()
-
-    # create mp3 using gTTS
-    gTTS(text=text, lang="en").save(tmp_name)
-
-    key = f"{prefix}/{os.path.basename(tmp_name)}"
-    # Upload explicitly setting ContentType
-    s3.upload_file(tmp_name, S3_BUCKET, key, ExtraArgs={"ContentType": "audio/mpeg"})
-    logger.info("Uploaded TTS to s3://%s/%s", S3_BUCKET, key)
-    return key
 
 
 # --- process_recording_background (proxy-based twiml update) ---
@@ -202,7 +242,7 @@ async def process_recording_background(
             logger.error("[%s] Failed to download recording after %d attempts: %s", call_sid, max_retries, download_url)
             # send fallback TwiML to caller
             try:
-                fallback = "<Response><Say>Sorry, I couldn't download your response. Please try again later.</Say></Response>"
+                fallback = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Say>Sorry, I couldn't download your response. Please try again later.</Say></Response>"
                 if twilio_client:
                     twilio_client.calls(call_sid).update(twiml=fallback)
             except Exception:
@@ -242,16 +282,18 @@ async def process_recording_background(
         # Upload TTS and build proxy URL
         try:
             s3_key = create_and_upload_tts(assistant_text)  # returns key like "tts/tmpxxx.mp3"
-            proxy_key = quote_plus(s3_key)
+            proxy_url = make_proxy_url(s3_key)
             if HOSTNAME:
-                proxy_url = f"https://{HOSTNAME}/tts-proxy?key={proxy_key}"
                 record_action = f"https://{HOSTNAME}/recording"
             else:
-                proxy_url = f"/tts-proxy?key={proxy_key}"
                 record_action = "/recording"
 
             # Build TwiML with XML declaration
-            twiml = f"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Response>\n    <Play>{proxy_url}</Play>\n    <Record maxLength=\"10\" action=				\"{record_action}\" playBeep=\"true\" timeout=\"2\"/>\n</Response>"
+            twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Play>{proxy_url}</Play>
+    <Record maxLength="10" action="{record_action}" playBeep="true" timeout="2"/>
+</Response>"""
             logger.info("[%s] updating Twilio with TwiML (proxy): %s", call_sid, twiml)
 
             try:
@@ -261,7 +303,7 @@ async def process_recording_background(
             except Exception:
                 logger.exception("[%s] Twilio update with proxy failed; attempting fallback Say", call_sid)
                 try:
-                    fallback = "<Response><Say>Sorry, I couldn't play the response. Please try again later.</Say></Response>"
+                    fallback = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Say>Sorry, I couldn't play the response. Please try again later.</Say></Response>"
                     if twilio_client:
                         twilio_client.calls(call_sid).update(twiml=fallback)
                 except Exception:
@@ -270,7 +312,7 @@ async def process_recording_background(
         except Exception:
             logger.exception("[%s] create_and_upload_tts or proxy build failed", call_sid)
             try:
-                fallback = "<Response><Say>Sorry, I couldn't prepare the reply. Please try again later.</Say></Response>"
+                fallback = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Say>Sorry, I couldn't prepare the reply. Please try again later.</Say></Response>"
                 if twilio_client:
                     twilio_client.calls(call_sid).update(twiml=fallback)
             except Exception:
@@ -279,7 +321,8 @@ async def process_recording_background(
     except Exception as e:
         logger.exception("[%s] Unexpected error in process_recording_background: %s", call_sid, e)
 
-# You may also want a simple health endpoint
+
+# Simple health endpoint
 @app.get("/")
 def index():
     return PlainTextResponse("OK")
