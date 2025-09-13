@@ -222,12 +222,16 @@ def recording_callback_url(request: Request) -> str:
 async def twiml(request: Request):
     """Return TwiML to start the call: say intro then record short user reply"""
     resp = VoiceResponse()
-    resp.say("Hello, this is our AI sales assistant. Please say something after the beep.", voice="alice")
+    resp.say(
+        "Hello, this is our AI sales assistant. Please say something after the beep.",
+        voice="alice"
+    )
 
     action_url = recording_callback_url(request)
     resp.record(max_length=5, action=action_url, play_beep=True, timeout=2)
-    return Response(content=str(resp), media_type="text/xml")
 
+    # Twilio wants `application/xml` here
+    return Response(content=str(resp), media_type="application/xml")
 # -------------------------
 # Recording webhook (Twilio posts after a Record completes)
 # -------------------------
