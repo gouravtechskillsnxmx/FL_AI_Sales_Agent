@@ -315,6 +315,90 @@ def tts_proxy(key: str):
         logger.exception("tts-proxy failed for key=%s: %s", key, e)
         return JSONResponse({"error":"tts_proxy_failed", "detail": str(e)}, status_code=500)
 
+# Transcription helper that supports openai>=1.0.0 and falls back to older clients.
+import time
+
+def transcribe_with_openai(file_path: str, model: str = "whisper-1", max_retries: int = 2, retry_delay: float = 1.0) -> str:
+    """
+    Transcribe an audio file using OpenAI.
+
+    Uses the new 'OpenAI' client (openai>=1.0.0) if available:
+        from openai import OpenAI
+        client = OpenAI()
+        resp = client.audio.transcriptions.create(model="whisper-1", file=audio_file)
+
+    Falls back to older openai.Audio.transcribe interface if the new one is not present.
+
+    Returns the transcribed text (empty string on failure).
+    """
+    if not file_path or not os.path.exists(file_path):
+        logger.warning("transcribe_with_openai: file not found: %s", file_path)
+        return ""
+
+    last_exc = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            # Try new OpenAI client first (openai>=1.0.0)
+            try:
+                from openai import OpenAI as OpenAIClient
+                client = OpenAIClient(api_key=OPENAI_KEY) if OPENAI_KEY else OpenAIClient()
+                with open(file_path, "rb") as f:
+                    # `audio.transcriptions.create` returns a response object with `.text` or ['text']
+                    resp = client.audio.transcriptions.create(model=model, file=f)
+                    # resp may be a dict-like or an object. Try common access patterns:
+                    if isinstance(resp, dict):
+                        text = resp.get("text") or resp.get("data") or ""
+                    else:
+                        # object with attribute 'text' in many examples
+                        text = getattr(resp, "text", None) or (resp.get("text") if hasattr(resp, "get") else None) or ""
+                    if not text:
+                        # Some variants return resp['text'] nested. Try stringifying resp.
+                        try:
+                            text = str(resp)
+                        except Exception:
+                            text = ""
+                    logger.info("transcribe_with_openai: new-client success (len=%d)", len(text) if text else 0)
+                    return (text or "").strip()
+            except Exception as new_client_exc:
+                # If the new client isn't available or raises, try the legacy API
+                last_exc = new_client_exc
+                logger.debug("transcribe_with_openai: new OpenAI client failed (attempt %d): %s", attempt, new_client_exc)
+
+            # Fallback: older openai package interface (pre-1.0)
+            try:
+                # legacy `openai` module (old interface) may already be imported as `openai`
+                if hasattr(openai, "Audio") and hasattr(openai.Audio, "transcribe"):
+                    with open(file_path, "rb") as f:
+                        resp = openai.Audio.transcribe(model, f)
+                        # resp likely has 'text' attribute or key
+                        if isinstance(resp, dict):
+                            text = resp.get("text", "") or resp.get("data", "")
+                        else:
+                            text = getattr(resp, "text", "") or ""
+                        logger.info("transcribe_with_openai: legacy-client success (len=%d)", len(text) if text else 0)
+                        return (text or "").strip()
+                else:
+                    # No transcribe interface available
+                    raise RuntimeError("No supported OpenAI transcription client available")
+            except Exception as legacy_exc:
+                last_exc = legacy_exc
+                logger.debug("transcribe_with_openai: legacy client failed (attempt %d): %s", attempt, legacy_exc)
+                # continue to retry loop below
+                raise legacy_exc
+
+        except Exception as exc:
+            logger.warning("transcribe_with_openai attempt %d/%d failed: %s", attempt, max_retries, exc)
+            if attempt < max_retries:
+                time.sleep(retry_delay * attempt)
+            else:
+                logger.exception("transcribe_with_openai: all attempts failed; returning empty transcript.")
+                return ""
+
+    # If we somehow exit loop without returning, return empty string
+    logger.warning("transcribe_with_openai: reached end without transcription for %s", file_path)
+    return ""
+
+
 
 # --- process_recording_background (proxy-based twiml update) ---
 async def process_recording_background(
@@ -323,118 +407,91 @@ async def process_recording_background(
     recording_sid: str | None = None,
     payload: dict | None = None
 ):
+    """
+    Background task: download recording, transcribe, call agent, generate TTS, and update Twilio call.
+    This version is safe: it always produces TwiML and checks call status before updating.
+    """
+    file_path = None
     try:
         logger.info("[%s] downloading recording: %s", call_sid, recording_url)
-        download_url = build_download_url(recording_url)
+        download_url = f"{recording_url}.mp3" if recording_url else None
 
-        # Ensure we have Twilio credentials for auth when fetching Twilio-hosted recordings
-        auth = HTTPBasicAuth(TWILIO_SID, TWILIO_TOKEN) if (TWILIO_SID and TWILIO_TOKEN) else None
-
-        # Download with retries
+        # --- Download recording from Twilio ---
         resp = None
-        max_retries = 3
-        backoff = 1.0
-        for attempt in range(1, max_retries + 1):
+        if download_url:
+            auth = HTTPBasicAuth(TWILIO_SID, TWILIO_TOKEN) if (TWILIO_SID and TWILIO_TOKEN) else None
             try:
-                logger.info("[%s] download attempt %d: %s", call_sid, attempt, download_url)
-                r = requests.get(download_url, auth=auth, timeout=20)
-                r.raise_for_status()
-                resp = r
-                break
-            except RequestException as e:
-                if isinstance(e, ConnectionError) and ("Failed to resolve" in str(e) or "Name or service not known" in str(e)):
-                    logger.error("[%s] name resolution error for %s: %s", call_sid, download_url, e)
-                    resp = None
-                    break
-                logger.warning("[%s] download attempt %d failed: %s", call_sid, attempt, e)
-                if attempt < max_retries:
-                    time.sleep(backoff)
-                    backoff *= 2
+                resp = requests.get(download_url, auth=auth, timeout=15)
+                resp.raise_for_status()
+            except Exception as e:
+                logger.exception("[%s] Failed to download recording: %s", call_sid, e)
+
+        if not resp or not resp.content:
+            logger.warning("[%s] No audio downloaded; using fallback text", call_sid)
+            assistant_text = "Sorry, I could not hear anything that time. Please try again."
+        else:
+            # Save to temp file
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+            tmp.write(resp.content)
+            tmp.flush()
+            tmp.close()
+            file_path = tmp.name
+
+            # --- Transcription ---
+            try:
+                transcript = transcribe_with_openai(file_path)
+            except Exception as e:
+                logger.exception("[%s] transcribe_with_openai failed: %s", call_sid, e)
+                transcript = ""
+
+            # --- Agent ---
+            try:
+                if asyncio.iscoroutinefunction(process_user_text):
+                    result = await process_user_text("default", call_sid, transcript)
                 else:
-                    resp = None
+                    loop = asyncio.get_running_loop()
+                    result = await loop.run_in_executor(None, lambda: process_user_text("default", call_sid, transcript))
+                assistant_text = result.get("reply_text") if isinstance(result, dict) else str(result)
+            except Exception as e:
+                logger.exception("[%s] process_user_text failed: %s", call_sid, e)
+                assistant_text = "I had trouble processing that. Could you repeat?"
 
-        if resp is None:
-            logger.error("[%s] Failed to download recording after %d attempts: %s", call_sid, max_retries, download_url)
-            # send fallback TwiML to caller
-            try:
-                fallback = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Say>Sorry, I couldn't download your response. Please try again later.</Say></Response>"
-                if twilio_client:
-                    twilio_client.calls(call_sid).update(twiml=fallback)
-            except Exception:
-                logger.exception("[%s] failed to send fallback TwiML", call_sid)
-            return
-
-        # Save temp file
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-        tmp.write(resp.content)
-        tmp.flush()
-        tmp.close()
-        file_path = tmp.name
-
-        # STT (assumes you have transcribe_with_openai implemented elsewhere)
-        transcript = ""
-        try:
-            transcript = transcribe_with_openai(file_path)
-            logger.info("[%s] transcript: %s", call_sid, transcript)
-        except Exception:
-            logger.exception("[%s] transcribe_with_openai failed", call_sid)
-
-        # Process with your agent (assumes process_user_text exists)
-        result = {}
-        try:
-            if asyncio.iscoroutinefunction(process_user_text):
-                result = await process_user_text("default", call_sid, transcript)
-            else:
-                loop = asyncio.get_running_loop()
-                result = await loop.run_in_executor(None, lambda: process_user_text("default", call_sid, transcript))
-        except Exception:
-            logger.exception("[%s] process_user_text failed", call_sid)
-
-        assistant_text = result.get("reply_text") if isinstance(result, dict) else (str(result) if result is not None else "")
+        # Ensure non-empty assistant_text
         if not assistant_text:
-            assistant_text = "Sorry, I'm having trouble answering right now."
+            assistant_text = "Sorry, I couldn't understand that. Please try again."
 
-        # Upload TTS and build proxy URL
+        # --- TTS + upload ---
         try:
-            s3_key = create_and_upload_tts(assistant_text)  # returns key like "tts/tmpxxx.mp3"
-            proxy_url = make_proxy_url(s3_key)
-            if HOSTNAME:
-                record_action = f"https://{HOSTNAME}/recording"
-            else:
-                record_action = "/recording"
+            tts_url = create_and_upload_tts(assistant_text)
+            logger.info("[%s] tts_url: %s", call_sid, tts_url)
+        except Exception as e:
+            logger.exception("[%s] TTS generation failed: %s", call_sid, e)
+            tts_url = None
 
-            # Build TwiML with XML declaration
+        # --- Build TwiML ---
+        record_action = f"https://{HOSTNAME}/recording" if HOSTNAME else "/recording"
+        if tts_url:
             twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Play>{proxy_url}</Play>
+    <Play>{tts_url}</Play>
     <Record maxLength="10" action="{record_action}" playBeep="true" timeout="2"/>
 </Response>"""
-            logger.info("[%s] updating Twilio with TwiML (proxy): %s", call_sid, twiml)
+        else:
+            twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say>Sorry, something went wrong generating audio. Please try again.</Say>
+    <Record maxLength="10" action="{record_action}" playBeep="true" timeout="2"/>
+</Response>"""
 
-            try:
-                if twilio_client:
-                    twilio_client.calls(call_sid).update(twiml=twiml)
-                    logger.info("[%s] Twilio update with proxy succeeded", call_sid)
-            except Exception:
-                logger.exception("[%s] Twilio update with proxy failed; attempting fallback Say", call_sid)
-                try:
-                    fallback = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Say>Sorry, I couldn't play the response. Please try again later.</Say></Response>"
-                    if twilio_client:
-                        twilio_client.calls(call_sid).update(twiml=fallback)
-                except Exception:
-                    logger.exception("[%s] sending fallback also failed", call_sid)
-
-        except Exception:
-            logger.exception("[%s] create_and_upload_tts or proxy build failed", call_sid)
-            try:
-                fallback = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Say>Sorry, I couldn't prepare the reply. Please try again later.</Say></Response>"
-                if twilio_client:
-                    twilio_client.calls(call_sid).update(twiml=fallback)
-            except Exception:
-                logger.exception("[%s] failed to send fallback TwiML after TTS error", call_sid)
+        # --- Update Twilio if call still active ---
+        updated = safe_update_call_with_twiml(call_sid, twiml)
+        if not updated:
+            logger.info("[%s] Call not updated (not in-progress or failed).", call_sid)
 
     except Exception as e:
         logger.exception("[%s] Unexpected error in process_recording_background: %s", call_sid, e)
+    finally:
+        safe_remove_file(file_path)
 
 
 # Simple health endpoint
