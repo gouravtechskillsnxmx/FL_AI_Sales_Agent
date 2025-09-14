@@ -276,17 +276,15 @@ async def twiml(request: Request):
 @app.post("/recording")
 async def recording(request: Request, background_tasks: BackgroundTasks):
     """
-    Twilio recording callback:
-      - schedule background processing (download -> transcribe -> TTS -> update call)
-      - immediately return TwiML that keeps the call alive (Pause) so the background job
-        can safely call safe_update_call_with_twiml(...) to inject audio.
+    Improved recording callback:
+      - attempt synchronous processing with a short timeout so we can return <Play> immediately.
+      - fallback to background processing + keep-alive TwiML if processing is too slow or fails.
     """
     try:
         form = await request.form()
         payload = dict(form)
     except Exception as e:
         logger.exception("Failed to parse form in /recording: %s", e)
-        # return explicit TwiML (application/xml) so Twilio doesn't complain about Content-Type
         return make_twiml_response("<Response><Say>Invalid request received.</Say></Response>")
 
     recording_url = payload.get("RecordingUrl") or payload.get("recordingurl")
@@ -301,13 +299,13 @@ async def recording(request: Request, background_tasks: BackgroundTasks):
         logger.warning("/recording missing CallSid; payload: %s", payload)
         return make_twiml_response("<Response><Say>Missing CallSid in webhook.</Say></Response>")
 
-    # Schedule background processing (non-blocking)
-    background_tasks.add_task(process_recording_background, call_sid, recording_url, recording_sid, payload)
-
-    # Keep-alive pause length (seconds) - configurable via env
+    # Configs (env override)
+    try:
+        SYNC_TIMEOUT_SECONDS = float(os.environ.get("RECORDING_SYNC_TIMEOUT", "12"))
+    except Exception:
+        SYNC_TIMEOUT_SECONDS = 12.0
     try:
         KEEPALIVE_SECONDS = int(os.environ.get("KEEPALIVE_SECONDS", "45"))
-        # clamp to a safe range
         if KEEPALIVE_SECONDS < 5:
             KEEPALIVE_SECONDS = 5
         elif KEEPALIVE_SECONDS > 120:
@@ -315,17 +313,110 @@ async def recording(request: Request, background_tasks: BackgroundTasks):
     except Exception:
         KEEPALIVE_SECONDS = 45
 
-    # Return valid TwiML (application/xml) to keep call open while background job runs
+    # Helper to perform the synchronous path (download -> transcribe -> agent -> tts -> upload)
+    async def do_sync_processing():
+        file_path = None
+        try:
+            if not recording_url:
+                logger.warning("[%s] no recording_url for sync path", call_sid)
+                return None
+
+            # Twilio recording resource requires .mp3 extension for direct download
+            download_url = recording_url if recording_url.lower().endswith((".mp3", ".wav", ".ogg", ".m4a")) else recording_url + ".mp3"
+            logger.info("[%s] synchronous processing: downloading %s", call_sid, download_url)
+
+            # Use requests (blocking) in a thread to avoid blocking event loop
+            loop = asyncio.get_running_loop()
+            def _download():
+                auth = HTTPBasicAuth(TWILIO_SID, TWILIO_TOKEN) if (TWILIO_SID and TWILIO_TOKEN) else None
+                r = requests.get(download_url, auth=auth, timeout=15)
+                r.raise_for_status()
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+                tmp.write(r.content)
+                tmp.flush()
+                tmp.close()
+                return tmp.name
+            file_path = await loop.run_in_executor(None, _download)
+
+            # Transcribe (may call OpenAI)
+            logger.info("[%s] synchronous processing: transcribing %s", call_sid, file_path)
+            # Use blocking transcribe function in executor if it's not async
+            if asyncio.iscoroutinefunction(transcribe_with_openai):
+                transcript = await asyncio.wait_for(transcribe_with_openai(file_path), timeout=SYNC_TIMEOUT_SECONDS - 2)
+            else:
+                transcript = await loop.run_in_executor(None, lambda: transcribe_with_openai(file_path))
+
+            logger.info("[%s] synchronous processing: transcript=%r", call_sid, transcript)
+
+            # Process user text (agent)
+            if asyncio.iscoroutinefunction(process_user_text):
+                result = await process_user_text("default", call_sid, transcript)
+            else:
+                result = await loop.run_in_executor(None, lambda: process_user_text("default", call_sid, transcript))
+
+            assistant_text = (result.get("reply_text") if isinstance(result, dict) else str(result)) or ""
+            if not assistant_text:
+                assistant_text = "Sorry, I couldn't understand that."
+
+            # Create TTS and upload
+            logger.info("[%s] synchronous processing: creating TTS", call_sid)
+            # create_and_upload_tts is blocking; run in executor
+            s3_key = await loop.run_in_executor(None, lambda: create_and_upload_tts(assistant_text))
+            logger.info("[%s] synchronous processing: uploaded tts s3://%s/%s", call_sid, S3_BUCKET, s3_key)
+
+            # Build proxied URL for Twilio to fetch
+            tts_url = make_proxy_url(s3_key)
+            full_tts_url = tts_url if tts_url.startswith("http") else (f"https://{HOSTNAME}{tts_url}" if HOSTNAME else tts_url)
+            return full_tts_url
+        except asyncio.TimeoutError:
+            logger.warning("[%s] synchronous processing timed out", call_sid)
+            return None
+        except Exception as e:
+            logger.exception("[%s] synchronous processing failed: %s", call_sid, e)
+            return None
+        finally:
+            # cleanup temp file if created
+            try:
+                if file_path and os.path.exists(file_path):
+                    os.remove(file_path)
+            except Exception:
+                logger.exception("[%s] cleanup failed for %s", call_sid, file_path)
+
+    # Try sync processing with timeout
+    try:
+        tts_play_url = await asyncio.wait_for(do_sync_processing(), timeout=SYNC_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        logger.warning("[%s] overall sync processing timed out after %.1fs", call_sid, SYNC_TIMEOUT_SECONDS)
+        tts_play_url = None
+    except Exception:
+        logger.exception("[%s] unexpected error during sync processing", call_sid)
+        tts_play_url = None
+
+    if tts_play_url:
+        # Succeeded synchronously — return TwiML that plays the generated audio immediately,
+        # then record again for the next user reply.
+        logger.info("[%s] returning immediate <Play> for %s", call_sid, tts_play_url)
+        record_action = recording_callback_url(request)
+        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+	<Response>
+  		<Play>{tts_play_url}</Play>
+  		<Record maxLength="15" action="{record_action}" playBeep="true" timeout="2"/>
+	</Response>"""
+        return make_twiml_response(twiml)
+
+    # Fallback: schedule background processing and return keep-alive TwiML
+    background_tasks.add_task(process_recording_background, call_sid, recording_url, recording_sid, payload)
+
     twiml_keepalive = f"""<?xml version="1.0" encoding="UTF-8"?>
 	<Response>
   		<Say voice="alice">Please hold while we process your response.</Say>
   		<Pause length="{KEEPALIVE_SECONDS}"/>
 	</Response>"""
-
-    logger.info("[%s] Returning keep-alive TwiML (pause %ds) while background task runs.",
+    logger.info("[%s] synchronous path failed/slow — scheduled background task and returning keep-alive (pause %ds).",
                 call_sid, KEEPALIVE_SECONDS)
 
     return make_twiml_response(twiml_keepalive)
+
     
 
 @app.get("/tts-proxy")
