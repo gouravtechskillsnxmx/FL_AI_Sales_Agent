@@ -88,18 +88,85 @@ if "transcribe_with_openai" not in globals():
 if "process_user_text" not in globals():
     def process_user_text(model_name: str, call_sid: str, user_text: str) -> dict:
         """
-        Temporary stub for agent processing.
-        Replace with your langchain/agent call to produce a reply and optional metadata.
-        Returns a dict with "reply_text".
+        Calls OpenAI to classify intent + produce reply_text.
+        Returns dict: {"intent","confidence","action","reply_text"}
+        Safe fallback guaranteed.
         """
-        logger.info("process_user_text (stub) called model=%s call_sid=%s user_text=%r", model_name, call_sid, user_text)
-        # Basic echo-ish reply for quick testing:
-        if not user_text or user_text.strip() == "":
-            # simulate inability to hear user
-            return {"reply_text": "Sorry, I had trouble hearing you. Could you repeat that?"}
-        else:
-            # simple canned answer (replace with GPT call)
-            return {"reply_text": f"I heard you say: {user_text}. Thanks for that."}
+        # Safety fallback
+        fallback = {
+            "intent": "unclear",
+            "confidence": 0.5,
+            "action": "ask_followup",
+            "reply_text": "Sorry, could you repeat? Are you looking to buy a specific product or get recommendations?"
+        }
+
+        try:
+            if not user_text or not user_text.strip():
+                return fallback
+
+            # Build prompt
+            system = (
+                "You are a concise outbound sales assistant. Always return a single valid JSON object and nothing else. "
+                "Keep reply_text <= 25 words."
+            )
+            user_prompt = f"""
+    Transcript: "{user_text}"
+
+    Context:
+    - The product is an ebook/subscription sales flow.
+    - Possible intents: ["purchase","info","not_interested","unclear","escalate"].
+    - Possible actions: ["ask_followup","answer_with_cta","offer_sms","transfer_human","hangup"].
+
+    Return JSON with keys:
+    {{ "intent": "<one of the intents>", "confidence": 0.0-1.0, "action": "<one of the actions>", "reply_text": "Short reply to speak next (<=25 words)" }}
+    """
+
+            # Call OpenAI ChatCompletion (sync). Adjust model name if needed.
+            # Uses openai.ChatCompletion.create for compatibility; change to new client if you prefer.
+            resp = openai.ChatCompletion.create(
+                model="gpt-4o-mini",  # replace with your available chat model
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_prompt}
+                ],
+                max_tokens=200,
+                temperature=0.0
+            )
+
+            # Extract assistant text
+            assistant_text = ""
+            if resp and "choices" in resp and len(resp["choices"]) > 0:
+                assistant_text = resp["choices"][0]["message"]["content"].strip()
+
+            # Parse JSON (model should return JSON only)
+            try:
+                parsed = json.loads(assistant_text)
+                # basic validation
+                intent = parsed.get("intent", "unclear")
+                confidence = float(parsed.get("confidence", 0.5))
+                action = parsed.get("action", "ask_followup")
+                reply_text = parsed.get("reply_text", "").strip()
+                if not reply_text:
+                    return fallback
+                return {
+                    "intent": intent,
+                    "confidence": max(0.0, min(1.0, confidence)),
+                    "action": action,
+                    "reply_text": reply_text
+                }
+            except Exception:
+                # If model returned non-JSON, try to salvage short reply by using whole assistant_text as reply_text
+                return {
+                    "intent": "unclear",
+                    "confidence": 0.5,
+                    "action": "ask_followup",
+                    "reply_text": assistant_text.splitlines()[0][:200] or fallback["reply_text"]
+                }
+
+        except Exception as e:
+            logger.exception("process_user_text OpenAI call failed: %s", e)
+            return fallback
+
 
 # 3) Helper to check call status safely
 from twilio.base.exceptions import TwilioRestException
@@ -549,6 +616,8 @@ def transcribe_with_openai(file_path: str, model: str = "whisper-1", max_retries
 
 
 # --- process_recording_background (proxy-based twiml update) ---
+# --- process_recording_background (proxy-based twiml update) ---
+# --- process_recording_background (proxy-based twiml update) ---
 async def process_recording_background(
     call_sid: str,
     recording_url: str | None = None,
@@ -592,8 +661,9 @@ async def process_recording_background(
                 logger.exception("[%s] transcribe_with_openai failed: %s", call_sid, e)
                 transcript = ""
 
-            # --- Agent ---
+            # --- Agent (LLM) ---
             try:
+                # process_user_text may be sync or async; run accordingly
                 if asyncio.iscoroutinefunction(process_user_text):
                     result = await process_user_text("default", call_sid, transcript)
                 else:
@@ -608,20 +678,33 @@ async def process_recording_background(
         if not assistant_text:
             assistant_text = "Sorry, I couldn't understand that. Please try again."
 
-        # --- TTS + upload ---
+        # --- TTS + upload (create S3 key) ---
         try:
-            tts_url = create_and_upload_tts(assistant_text)
-            logger.info("[%s] tts_url: %s", call_sid, tts_url)
+            s3_key = create_and_upload_tts(assistant_text)
+            logger.info("[%s] created tts s3 key: %s", call_sid, s3_key)
         except Exception as e:
             logger.exception("[%s] TTS generation failed: %s", call_sid, e)
-            tts_url = None
+            s3_key = None
 
         # --- Build TwiML ---
         record_action = f"https://{HOSTNAME}/recording" if HOSTNAME else "/recording"
-        if tts_url:
+
+        if s3_key:
+            # Convert S3 key -> proxy path and ensure absolute URL for Twilio
+            proxy_path = make_proxy_url(s3_key)  # may return absolute if HOSTNAME set
+            if proxy_path.startswith("http"):
+                play_url = proxy_path
+            else:
+                # make absolute using HOSTNAME (must be set in env for public access)
+                if HOSTNAME:
+                    play_url = f"https://{HOSTNAME}{proxy_path if proxy_path.startswith('/') else '/' + proxy_path}"
+                else:
+                    # best-effort fallback: play whatever proxy_path is (may fail if relative)
+                    play_url = proxy_path
+
             twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Play>{tts_url}</Play>
+    <Play>{play_url}</Play>
     <Record maxLength="10" action="{record_action}" playBeep="true" timeout="2"/>
 </Response>"""
         else:

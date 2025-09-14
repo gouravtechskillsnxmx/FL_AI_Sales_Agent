@@ -17,5 +17,7 @@ python-dotenv
 redis
 rq
 langchain_community
+requests
+starlette
 
 
