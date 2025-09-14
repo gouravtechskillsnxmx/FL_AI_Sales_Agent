@@ -297,8 +297,9 @@ async def recording(request: Request, background_tasks: BackgroundTasks):
     # schedule background processing and ack quickly
     background_tasks.add_task(process_recording_background, call_sid, recording_url, recording_sid, payload)
     # Return 204 No Content (Twilio accepts this)
-    return Response(status_code=204)
-
+    twiml_ack = '<?xml version="1.0" encoding="UTF-8"?><Response></Response>'
+    return Response(content=twiml_ack, media_type="application/xml", status_code=200)
+    
 
 @app.get("/tts-proxy")
 def tts_proxy(key: str):
