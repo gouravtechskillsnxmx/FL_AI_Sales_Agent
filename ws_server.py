@@ -367,6 +367,7 @@ async def twiml(request: Request):
     resp = VoiceResponse()
     resp.say("Hello, this is our AI sales assistant. Please say something after the beep.", voice="alice")
     action_url = recording_callback_url(request)
+    logger.info("Action_URL %s",action_url)
     resp.record(max_length=5, action=action_url, play_beep=True, timeout=2)
     return make_twiml_response(str(resp))
 
