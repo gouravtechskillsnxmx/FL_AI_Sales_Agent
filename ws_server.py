@@ -69,30 +69,33 @@ if OPENAI_KEY:
 
 # 1) Safe transcribe stub (define only if missing)
 if "transcribe_with_openai" not in globals():
-    def transcribe_with_openai(audio_path: str) -> str:
-        """
-        Temporary safe stub for transcription.
-        Replace with your production transcription using OpenAI whisper or other STT.
-        For now returns empty string (meaning 'no transcript') and logs the event.
-        """
+    def transcribe_with_openai(file_path: str) -> str:
         try:
-            logger.info("transcribe_with_openai: stub used for file=%s", audio_path)
-            # Optionally: if you want basic local transcription for quick tests,
-            # integrate a lightweight STT here, otherwise return empty.
-            return ""  # empty transcript -> agent fallback will be used
+            with open(file_path, "rb") as f:
+                resp = openai.audio.transcriptions.create(
+                    model="gpt-4o-mini-transcribe",  # or "whisper-1"
+                    file=f
+                )
+            text = resp.text.strip() if hasattr(resp, "text") else resp.get("text", "").strip()
+            if not text:
+                logger.warning("transcribe_with_openai: got empty transcript, file=%s", file_path)
+            return text
         except Exception as e:
-            logger.exception("transcribe_with_openai (stub) failed: %s", e)
+            logger.exception("transcribe_with_openai failed: %s", e)
             return ""
+
 
 # 2) Safe process_user_text stub (define only if missing)
 if "process_user_text" not in globals():
+
     def process_user_text(model_name: str, call_sid: str, user_text: str) -> dict:
         """
-        Calls OpenAI to classify intent + produce reply_text.
-        Returns dict: {"intent","confidence","action","reply_text"}
-        Safe fallback guaranteed.
+        Use OpenAI to classify intent and generate a short reply.
+        Returns a dict with keys: intent, confidence, action, reply_text.
+
+        This function prefers the new openai v1+ client (OpenAI.chat.completions.create).
+        If unavailable, it falls back to openai.ChatCompletion (legacy).
         """
-        # Safety fallback
         fallback = {
             "intent": "unclear",
             "confidence": 0.5,
@@ -104,10 +107,16 @@ if "process_user_text" not in globals():
             if not user_text or not user_text.strip():
                 return fallback
 
-            # Build prompt
+            # model selection: allow override via env
+            LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+            # safety: keep deterministic outputs
+            temperature = 0.0
+            max_tokens = 200
+
+            # Construct the strict prompt (model should return JSON only)
             system = (
-                "You are a concise outbound sales assistant. Always return a single valid JSON object and nothing else. "
-                "Keep reply_text <= 25 words."
+                "You are a concise outbound sales assistant. Always return a single valid JSON object "
+                "and nothing else. Keep reply_text <= 25 words."
             )
             user_prompt = f"""
     Transcript: "{user_text}"
@@ -121,31 +130,51 @@ if "process_user_text" not in globals():
     {{ "intent": "<one of the intents>", "confidence": 0.0-1.0, "action": "<one of the actions>", "reply_text": "Short reply to speak next (<=25 words)" }}
     """
 
-            # Call OpenAI ChatCompletion (sync). Adjust model name if needed.
-            # Uses openai.ChatCompletion.create for compatibility; change to new client if you prefer.
-            resp = openai.ChatCompletion.create(
-                model="gpt-4o-mini",  # replace with your available chat model
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user_prompt}
-                ],
-                max_tokens=200,
-                temperature=0.0
-            )
+            assistant_text = None
 
-            # Extract assistant text
-            assistant_text = ""
-            if resp and "choices" in resp and len(resp["choices"]) > 0:
-                assistant_text = resp["choices"][0]["message"]["content"].strip()
+            # Try new client (openai>=1.0.0)
+            try:
+                from openai import OpenAI as OpenAIClient
+                client = OpenAIClient(api_key=OPENAI_KEY) if globals().get("OPENAI_KEY") else OpenAIClient()
+                resp = client.chat.completions.create(
+                    model=LLM_MODEL,
+                    messages=[{"role": "system", "content": system}, {"role": "user", "content": user_prompt}],
+                    max_tokens=max_tokens,
+                    temperature=temperature
+                )
+                # resp may be object-like or dict-like; extract content robustly
+                try:
+                    assistant_text = resp.choices[0].message.content
+                except Exception:
+                    # dict-like fallback
+                    assistant_text = resp["choices"][0]["message"]["content"]
+            except Exception as new_exc:
+                # If new client not available or it failed, try legacy API (older openai package)
+                try:
+                    logger.debug("process_user_text: new OpenAI client unavailable/failing, falling back to legacy. err=%s", new_exc)
+                    resp = openai.ChatCompletion.create(
+                        model=LLM_MODEL,
+                        messages=[{"role": "system", "content": system}, {"role": "user", "content": user_prompt}],
+                        max_tokens=max_tokens,
+                        temperature=temperature
+                    )
+                    assistant_text = resp["choices"][0]["message"]["content"]
+                except Exception as legacy_exc:
+                    logger.exception("process_user_text: both new and legacy OpenAI calls failed: %s / %s", new_exc, legacy_exc)
+                    return fallback
 
-            # Parse JSON (model should return JSON only)
+            # At this point assistant_text should be a JSON string (model instructed to return JSON only)
+            if not assistant_text:
+                logger.warning("[%s] process_user_text: empty assistant_text from model", call_sid)
+                return fallback
+
+            # Try to parse JSON strictly
             try:
                 parsed = json.loads(assistant_text)
-                # basic validation
                 intent = parsed.get("intent", "unclear")
                 confidence = float(parsed.get("confidence", 0.5))
                 action = parsed.get("action", "ask_followup")
-                reply_text = parsed.get("reply_text", "").strip()
+                reply_text = str(parsed.get("reply_text", "")).strip()
                 if not reply_text:
                     return fallback
                 return {
@@ -154,13 +183,15 @@ if "process_user_text" not in globals():
                     "action": action,
                     "reply_text": reply_text
                 }
-            except Exception:
-                # If model returned non-JSON, try to salvage short reply by using whole assistant_text as reply_text
+            except Exception as parse_exc:
+                # If the model returned non-JSON, salvage a short reply from the text
+                logger.exception("process_user_text: failed to parse JSON from model output: %s; output=%r", parse_exc, assistant_text)
+                first_line = assistant_text.strip().splitlines()[0][:250]
                 return {
                     "intent": "unclear",
                     "confidence": 0.5,
                     "action": "ask_followup",
-                    "reply_text": assistant_text.splitlines()[0][:200] or fallback["reply_text"]
+                    "reply_text": first_line or fallback["reply_text"]
                 }
 
         except Exception as e:
@@ -338,7 +369,6 @@ async def twiml(request: Request):
     action_url = recording_callback_url(request)
     resp.record(max_length=5, action=action_url, play_beep=True, timeout=2)
     return make_twiml_response(str(resp))
-
 
 @app.post("/recording")
 async def recording(request: Request, background_tasks: BackgroundTasks):
@@ -665,6 +695,7 @@ async def process_recording_background(
             try:
                 # process_user_text may be sync or async; run accordingly
                 if asyncio.iscoroutinefunction(process_user_text):
+                    logger.info("[%s] transcript from STT (len=%d): %r", call_sid, len(transcript or ""), transcript)
                     result = await process_user_text("default", call_sid, transcript)
                 else:
                     loop = asyncio.get_running_loop()
