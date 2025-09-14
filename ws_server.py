@@ -276,9 +276,10 @@ async def twiml(request: Request):
 @app.post("/recording")
 async def recording(request: Request, background_tasks: BackgroundTasks):
     """
-    Improved recording callback:
+    Robust recording callback:
       - attempt synchronous processing with a short timeout so we can return <Play> immediately.
-      - fallback to background processing + keep-alive TwiML if processing is too slow or fails.
+      - if sync path times out, schedule background processing and return a keep-alive Pause.
+      - ensure temp files are not deleted while executor threads still need them.
     """
     try:
         form = await request.form()
@@ -301,9 +302,9 @@ async def recording(request: Request, background_tasks: BackgroundTasks):
 
     # Configs (env override)
     try:
-        SYNC_TIMEOUT_SECONDS = float(os.environ.get("RECORDING_SYNC_TIMEOUT", "12"))
+        SYNC_TIMEOUT_SECONDS = float(os.environ.get("RECORDING_SYNC_TIMEOUT", "18"))
     except Exception:
-        SYNC_TIMEOUT_SECONDS = 12.0
+        SYNC_TIMEOUT_SECONDS = 18.0
     try:
         KEEPALIVE_SECONDS = int(os.environ.get("KEEPALIVE_SECONDS", "45"))
         if KEEPALIVE_SECONDS < 5:
@@ -313,20 +314,36 @@ async def recording(request: Request, background_tasks: BackgroundTasks):
     except Exception:
         KEEPALIVE_SECONDS = 45
 
-    # Helper to perform the synchronous path (download -> transcribe -> agent -> tts -> upload)
+    loop = asyncio.get_running_loop()
+
+    # helper to schedule deletion of a temp file after a future is done
+    async def cleanup_when_done(fut, path):
+        try:
+            await asyncio.wrap_future(fut) if isinstance(fut, asyncio.Future) else None
+        except Exception:
+            # we don't care about the result, just wait for completion
+            pass
+        await asyncio.sleep(0.05)  # tiny delay to ensure file handles closed
+        try:
+            if path and os.path.exists(path):
+                os.remove(path)
+                logger.debug("cleanup_when_done: removed %s", path)
+        except Exception:
+            logger.exception("cleanup_when_done failed for %s", path)
+
+    # Synchronous path that runs blocking operations in thread executor.
     async def do_sync_processing():
         file_path = None
+        transcribe_future = None
         try:
             if not recording_url:
                 logger.warning("[%s] no recording_url for sync path", call_sid)
                 return None
 
-            # Twilio recording resource requires .mp3 extension for direct download
             download_url = recording_url if recording_url.lower().endswith((".mp3", ".wav", ".ogg", ".m4a")) else recording_url + ".mp3"
             logger.info("[%s] synchronous processing: downloading %s", call_sid, download_url)
 
-            # Use requests (blocking) in a thread to avoid blocking event loop
-            loop = asyncio.get_running_loop()
+            # download in executor (blocking requests)
             def _download():
                 auth = HTTPBasicAuth(TWILIO_SID, TWILIO_TOKEN) if (TWILIO_SID and TWILIO_TOKEN) else None
                 r = requests.get(download_url, auth=auth, timeout=15)
@@ -336,19 +353,20 @@ async def recording(request: Request, background_tasks: BackgroundTasks):
                 tmp.flush()
                 tmp.close()
                 return tmp.name
+
             file_path = await loop.run_in_executor(None, _download)
+            logger.info("[%s] synchronous processing: downloaded to %s", call_sid, file_path)
 
-            # Transcribe (may call OpenAI)
-            logger.info("[%s] synchronous processing: transcribing %s", call_sid, file_path)
-            # Use blocking transcribe function in executor if it's not async
-            if asyncio.iscoroutinefunction(transcribe_with_openai):
-                transcript = await asyncio.wait_for(transcribe_with_openai(file_path), timeout=SYNC_TIMEOUT_SECONDS - 2)
-            else:
-                transcript = await loop.run_in_executor(None, lambda: transcribe_with_openai(file_path))
+            # transcribe in executor and track its future so we don't delete the file while it runs.
+            def _transcribe():
+                return transcribe_with_openai(file_path)
 
+            transcribe_future = loop.run_in_executor(None, _transcribe)
+            # await with timeout left for other steps
+            transcript = await asyncio.wait_for(asyncio.wrap_future(asyncio.ensure_future(transcribe_future)), timeout=max(4, SYNC_TIMEOUT_SECONDS - 6))
             logger.info("[%s] synchronous processing: transcript=%r", call_sid, transcript)
 
-            # Process user text (agent)
+            # agent processing (can be blocking)
             if asyncio.iscoroutinefunction(process_user_text):
                 result = await process_user_text("default", call_sid, transcript)
             else:
@@ -358,29 +376,42 @@ async def recording(request: Request, background_tasks: BackgroundTasks):
             if not assistant_text:
                 assistant_text = "Sorry, I couldn't understand that."
 
-            # Create TTS and upload
-            logger.info("[%s] synchronous processing: creating TTS", call_sid)
-            # create_and_upload_tts is blocking; run in executor
+            # create tts (blocking) in executor
             s3_key = await loop.run_in_executor(None, lambda: create_and_upload_tts(assistant_text))
             logger.info("[%s] synchronous processing: uploaded tts s3://%s/%s", call_sid, S3_BUCKET, s3_key)
 
-            # Build proxied URL for Twilio to fetch
             tts_url = make_proxy_url(s3_key)
             full_tts_url = tts_url if tts_url.startswith("http") else (f"https://{HOSTNAME}{tts_url}" if HOSTNAME else tts_url)
             return full_tts_url
+
         except asyncio.TimeoutError:
             logger.warning("[%s] synchronous processing timed out", call_sid)
+            # Do not delete the file here if transcribe_future is still running; schedule cleanup for later.
+            if transcribe_future and not transcribe_future.done() and file_path:
+                loop.create_task(cleanup_when_done(transcribe_future, file_path))
             return None
         except Exception as e:
             logger.exception("[%s] synchronous processing failed: %s", call_sid, e)
+            # if a future still running, schedule cleanup to avoid leaking temp file
+            if transcribe_future and not transcribe_future.done() and file_path:
+                loop.create_task(cleanup_when_done(transcribe_future, file_path))
+            else:
+                # safe to remove now
+                try:
+                    if file_path and os.path.exists(file_path):
+                        os.remove(file_path)
+                except Exception:
+                    logger.exception("[%s] failed removing temp file %s", call_sid, file_path)
             return None
         finally:
-            # cleanup temp file if created
+            # If transcribe_future is None or completed, it's safe to remove file here.
             try:
-                if file_path and os.path.exists(file_path):
-                    os.remove(file_path)
+                if (not transcribe_future or (hasattr(transcribe_future, "done") and transcribe_future.done())) and file_path:
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                        logger.debug("[%s] removed temp file in finally: %s", call_sid, file_path)
             except Exception:
-                logger.exception("[%s] cleanup failed for %s", call_sid, file_path)
+                logger.exception("[%s] cleanup in finally failed for %s", call_sid, file_path)
 
     # Try sync processing with timeout
     try:
@@ -393,28 +424,26 @@ async def recording(request: Request, background_tasks: BackgroundTasks):
         tts_play_url = None
 
     if tts_play_url:
-        # Succeeded synchronously — return TwiML that plays the generated audio immediately,
-        # then record again for the next user reply.
+        # Return TwiML to play immediate audio, then record again
         logger.info("[%s] returning immediate <Play> for %s", call_sid, tts_play_url)
         record_action = recording_callback_url(request)
         twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-	<Response>
-  		<Play>{tts_play_url}</Play>
-  		<Record maxLength="15" action="{record_action}" playBeep="true" timeout="2"/>
-	</Response>"""
+<Response>
+  <Play>{tts_play_url}</Play>
+  <Record maxLength="15" action="{record_action}" playBeep="true" timeout="2"/>
+</Response>"""
         return make_twiml_response(twiml)
 
     # Fallback: schedule background processing and return keep-alive TwiML
     background_tasks.add_task(process_recording_background, call_sid, recording_url, recording_sid, payload)
 
     twiml_keepalive = f"""<?xml version="1.0" encoding="UTF-8"?>
-	<Response>
-  		<Say voice="alice">Please hold while we process your response.</Say>
-  		<Pause length="{KEEPALIVE_SECONDS}"/>
-	</Response>"""
+<Response>
+  <Say voice="alice">Please hold while we process your response.</Say>
+  <Pause length="{KEEPALIVE_SECONDS}"/>
+</Response>"""
     logger.info("[%s] synchronous path failed/slow — scheduled background task and returning keep-alive (pause %ds).",
                 call_sid, KEEPALIVE_SECONDS)
-
     return make_twiml_response(twiml_keepalive)
 
     
