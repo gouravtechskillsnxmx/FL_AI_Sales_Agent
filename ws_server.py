@@ -275,11 +275,18 @@ async def twiml(request: Request):
 
 @app.post("/recording")
 async def recording(request: Request, background_tasks: BackgroundTasks):
+    """
+    Twilio recording callback:
+      - schedule background processing (download -> transcribe -> TTS -> update call)
+      - immediately return TwiML that keeps the call alive (Pause) so the background job
+        can safely call safe_update_call_with_twiml(...) to inject audio.
+    """
     try:
         form = await request.form()
         payload = dict(form)
     except Exception as e:
         logger.exception("Failed to parse form in /recording: %s", e)
+        # return explicit TwiML (application/xml) so Twilio doesn't complain about Content-Type
         return make_twiml_response("<Response><Say>Invalid request received.</Say></Response>")
 
     recording_url = payload.get("RecordingUrl") or payload.get("recordingurl")
@@ -294,11 +301,31 @@ async def recording(request: Request, background_tasks: BackgroundTasks):
         logger.warning("/recording missing CallSid; payload: %s", payload)
         return make_twiml_response("<Response><Say>Missing CallSid in webhook.</Say></Response>")
 
-    # schedule background processing and ack quickly
+    # Schedule background processing (non-blocking)
     background_tasks.add_task(process_recording_background, call_sid, recording_url, recording_sid, payload)
-    # Return 204 No Content (Twilio accepts this)
-    twiml_ack = '<?xml version="1.0" encoding="UTF-8"?><Response></Response>'
-    return Response(content=twiml_ack, media_type="application/xml", status_code=200)
+
+    # Keep-alive pause length (seconds) - configurable via env
+    try:
+        KEEPALIVE_SECONDS = int(os.environ.get("KEEPALIVE_SECONDS", "45"))
+        # clamp to a safe range
+        if KEEPALIVE_SECONDS < 5:
+            KEEPALIVE_SECONDS = 5
+        elif KEEPALIVE_SECONDS > 120:
+            KEEPALIVE_SECONDS = 120
+    except Exception:
+        KEEPALIVE_SECONDS = 45
+
+    # Return valid TwiML (application/xml) to keep call open while background job runs
+    twiml_keepalive = f"""<?xml version="1.0" encoding="UTF-8"?>
+	<Response>
+  		<Say voice="alice">Please hold while we process your response.</Say>
+  		<Pause length="{KEEPALIVE_SECONDS}"/>
+	</Response>"""
+
+    logger.info("[%s] Returning keep-alive TwiML (pause %ds) while background task runs.",
+                call_sid, KEEPALIVE_SECONDS)
+
+    return make_twiml_response(twiml_keepalive)
     
 
 @app.get("/tts-proxy")
