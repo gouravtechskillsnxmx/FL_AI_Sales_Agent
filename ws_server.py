@@ -530,10 +530,11 @@ async def recording(request: Request, background_tasks: BackgroundTasks):
   <Play>{tts_play_url}</Play>
   <Record maxLength="15" action="{record_action}" playBeep="true" timeout="2"/>
 </Response>"""
+        # Fallback: schedule background processing and return keep-alive TwiML
+        loop = asyncio.get_running_loop()
+        loop.create_task(process_recording_background(call_sid, recording_url, recording_sid, payload))
+        logger.info("[%s] scheduled process_recording_background via loop.create_task", call_sid)
         return make_twiml_response(twiml)
-
-    # Fallback: schedule background processing and return keep-alive TwiML
-    background_tasks.add_task(process_recording_background, call_sid, recording_url, recording_sid, payload)
 
     twiml_keepalive = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
