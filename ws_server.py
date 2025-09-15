@@ -69,20 +69,53 @@ if OPENAI_KEY:
 
 # 1) Safe transcribe stub (define only if missing)
 if "transcribe_with_openai" not in globals():
-    def transcribe_with_openai(file_path: str) -> str:
-        try:
-            with open(file_path, "rb") as f:
-                resp = openai.audio.transcriptions.create(
-                    model="gpt-4o-mini-transcribe",  # or "whisper-1"
-                    file=f
-                )
-            text = resp.text.strip() if hasattr(resp, "text") else resp.get("text", "").strip()
-            if not text:
-                logger.warning("transcribe_with_openai: got empty transcript, file=%s", file_path)
-            return text
-        except Exception as e:
-            logger.exception("transcribe_with_openai failed: %s", e)
+    def transcribe_with_openai(file_path: str, model: str = "whisper-1", max_retries: int = 2, retry_delay: float = 1.0) -> str:
+        if not file_path or not os.path.exists(file_path):
+            logger.warning("transcribe_with_openai: file not found: %s", file_path)
             return ""
+
+        last_exc = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                logger.info("transcribe_with_openai: attempt %d for file=%s", attempt, file_path)
+                # Try new client pattern first
+                try:
+                    from openai import OpenAI as OpenAIClient
+                    client = OpenAIClient(api_key=OPENAI_KEY) if OPENAI_KEY else OpenAIClient()
+                    with open(file_path, "rb") as f:
+                        resp = client.audio.transcriptions.create(model=model, file=f)
+                    # robust extraction
+                    if isinstance(resp, dict):
+                        text = resp.get("text") or resp.get("data") or ""
+                    else:
+                        text = getattr(resp, "text", "") or ""
+                    logger.info("transcribe_with_openai: new-client success (len=%d)", len(text or ""))
+                    return (text or "").strip()
+                except Exception as new_client_exc:
+                    last_exc = new_client_exc
+                    logger.debug("transcribe_with_openai: new client failed: %s", new_client_exc)
+                    # fallback to legacy
+                    if hasattr(openai, "Audio") and hasattr(openai.Audio, "transcribe"):
+                        with open(file_path, "rb") as f:
+                            resp = openai.Audio.transcribe(model, f)
+                            if isinstance(resp, dict):
+                                text = resp.get("text", "") or ""
+                            else:
+                                text = getattr(resp, "text", "") or ""
+                            logger.info("transcribe_with_openai: legacy-client success (len=%d)", len(text or ""))
+                            return (text or "").strip()
+                    else:
+                        raise RuntimeError("No supported transcription client available")
+            except Exception as exc:
+                logger.warning("transcribe_with_openai attempt %d/%d failed: %s", attempt, max_retries, exc)
+                last_exc = exc
+                if attempt < max_retries:
+                    time.sleep(retry_delay * attempt)
+                else:
+                    logger.exception("transcribe_with_openai: all attempts failed; returning empty transcript.")
+                    return ""
+        logger.warning("transcribe_with_openai: reached end without transcription for %s; last error: %s", file_path, last_exc)
+        return ""
 
 
 # 2) Safe process_user_text stub (define only if missing)
@@ -90,12 +123,12 @@ if "process_user_text" not in globals():
 
     def process_user_text(model_name: str, call_sid: str, user_text: str) -> dict:
         """
-        Use OpenAI to classify intent and generate a short reply.
-        Returns a dict with keys: intent, confidence, action, reply_text.
-
-        This function prefers the new openai v1+ client (OpenAI.chat.completions.create).
-        If unavailable, it falls back to openai.ChatCompletion (legacy).
+        Calls OpenAI to classify intent + produce reply_text.
+        Returns dict: {"intent","confidence","action","reply_text"}.
+        Detailed logging added to trace OpenAI invocation & parsing.
         """
+        logger.info("[%s] process_user_text START. raw user_text repr: %r", call_sid, user_text)
+
         fallback = {
             "intent": "unclear",
             "confidence": 0.5,
@@ -103,22 +136,31 @@ if "process_user_text" not in globals():
             "reply_text": "Sorry, could you repeat? Are you looking to buy a specific product or get recommendations?"
         }
 
-        try:
-            if not user_text or not user_text.strip():
-                return fallback
+        # normalize
+        if user_text is None:
+            user_text = ""
+        user_text = str(user_text).strip()
 
-            # model selection: allow override via env
-            LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
-            # safety: keep deterministic outputs
-            temperature = 0.0
-            max_tokens = 200
+        if not user_text:
+            logger.info("[%s] process_user_text: empty user_text -> returning short ask_repeat", call_sid)
+            return {
+                "intent": "unclear",
+                "confidence": 0.2,
+                "action": "ask_followup",
+                "reply_text": "Sorry, I didn't catch that. Please repeat after the beep."
+            }
 
-            # Construct the strict prompt (model should return JSON only)
-            system = (
-                "You are a concise outbound sales assistant. Always return a single valid JSON object "
-                "and nothing else. Keep reply_text <= 25 words."
-            )
-            user_prompt = f"""
+        # Build prompt
+        LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+        temperature = 0.0
+        max_tokens = 250
+
+        system = (
+            "You are a concise outbound sales assistant. Always return a single valid JSON object and nothing else. "
+            "Keep reply_text <= 25 words."
+        )
+
+        user_prompt = f"""
     Transcript: "{user_text}"
 
     Context:
@@ -130,74 +172,76 @@ if "process_user_text" not in globals():
     {{ "intent": "<one of the intents>", "confidence": 0.0-1.0, "action": "<one of the actions>", "reply_text": "Short reply to speak next (<=25 words)" }}
     """
 
-            assistant_text = None
+        logger.info("[%s] process_user_text: calling LLM model=%s; prompt length=%d", call_sid, LLM_MODEL, len(user_prompt))
 
-            # Try new client (openai>=1.0.0)
+        assistant_text = None
+
+        # Try the new OpenAI client first (openai>=1.0.0)
+        try:
+            from openai import OpenAI as OpenAIClient
+            client = OpenAIClient(api_key=OPENAI_KEY) if globals().get("OPENAI_KEY") else OpenAIClient()
+            logger.info("[%s] process_user_text: using OpenAI v1+ client", call_sid)
+            resp = client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user_prompt}],
+                max_tokens=max_tokens,
+                temperature=temperature
+            )
+            # robust extraction
             try:
-                from openai import OpenAI as OpenAIClient
-                client = OpenAIClient(api_key=OPENAI_KEY) if globals().get("OPENAI_KEY") else OpenAIClient()
-                resp = client.chat.completions.create(
+                assistant_text = resp.choices[0].message.content
+            except Exception:
+                assistant_text = resp["choices"][0]["message"]["content"]
+            logger.info("[%s] process_user_text: LLM returned %d chars", call_sid, len(assistant_text or ""))
+        except Exception as new_exc:
+            # fallback to legacy openai interface if available
+            try:
+                logger.warning("[%s] process_user_text: new OpenAI client failed: %s — falling back to legacy API", call_sid, new_exc)
+                resp = openai.ChatCompletion.create(
                     model=LLM_MODEL,
                     messages=[{"role": "system", "content": system}, {"role": "user", "content": user_prompt}],
                     max_tokens=max_tokens,
                     temperature=temperature
                 )
-                # resp may be object-like or dict-like; extract content robustly
-                try:
-                    assistant_text = resp.choices[0].message.content
-                except Exception:
-                    # dict-like fallback
-                    assistant_text = resp["choices"][0]["message"]["content"]
-            except Exception as new_exc:
-                # If new client not available or it failed, try legacy API (older openai package)
-                try:
-                    logger.debug("process_user_text: new OpenAI client unavailable/failing, falling back to legacy. err=%s", new_exc)
-                    resp = openai.ChatCompletion.create(
-                        model=LLM_MODEL,
-                        messages=[{"role": "system", "content": system}, {"role": "user", "content": user_prompt}],
-                        max_tokens=max_tokens,
-                        temperature=temperature
-                    )
-                    assistant_text = resp["choices"][0]["message"]["content"]
-                except Exception as legacy_exc:
-                    logger.exception("process_user_text: both new and legacy OpenAI calls failed: %s / %s", new_exc, legacy_exc)
-                    return fallback
-
-            # At this point assistant_text should be a JSON string (model instructed to return JSON only)
-            if not assistant_text:
-                logger.warning("[%s] process_user_text: empty assistant_text from model", call_sid)
+                assistant_text = resp["choices"][0]["message"]["content"]
+                logger.info("[%s] process_user_text: legacy client returned %d chars", call_sid, len(assistant_text or ""))
+            except Exception as legacy_exc:
+                logger.exception("[%s] process_user_text: both new and legacy OpenAI calls failed: %s / %s", call_sid, new_exc, legacy_exc)
                 return fallback
 
-            # Try to parse JSON strictly
-            try:
-                parsed = json.loads(assistant_text)
-                intent = parsed.get("intent", "unclear")
-                confidence = float(parsed.get("confidence", 0.5))
-                action = parsed.get("action", "ask_followup")
-                reply_text = str(parsed.get("reply_text", "")).strip()
-                if not reply_text:
-                    return fallback
-                return {
-                    "intent": intent,
-                    "confidence": max(0.0, min(1.0, confidence)),
-                    "action": action,
-                    "reply_text": reply_text
-                }
-            except Exception as parse_exc:
-                # If the model returned non-JSON, salvage a short reply from the text
-                logger.exception("process_user_text: failed to parse JSON from model output: %s; output=%r", parse_exc, assistant_text)
-                first_line = assistant_text.strip().splitlines()[0][:250]
-                return {
-                    "intent": "unclear",
-                    "confidence": 0.5,
-                    "action": "ask_followup",
-                    "reply_text": first_line or fallback["reply_text"]
-                }
-
-        except Exception as e:
-            logger.exception("process_user_text OpenAI call failed: %s", e)
+        if not assistant_text:
+            logger.warning("[%s] process_user_text: assistant_text empty after LLM call", call_sid)
             return fallback
 
+        # Parse model JSON output safely
+        try:
+            parsed = json.loads(assistant_text)
+            intent = parsed.get("intent", "unclear")
+            confidence = float(parsed.get("confidence", 0.5))
+            action = parsed.get("action", "ask_followup")
+            reply_text = str(parsed.get("reply_text", "")).strip()
+            if not reply_text:
+                logger.warning("[%s] process_user_text: parsed JSON missing reply_text -> fallback", call_sid)
+                return fallback
+            logger.info("[%s] process_user_text: parsed intent=%s confidence=%.2f action=%s reply_text=%r",
+                        call_sid, intent, confidence, action, reply_text)
+            return {
+                "intent": intent,
+                "confidence": max(0.0, min(1.0, confidence)),
+                "action": action,
+                "reply_text": reply_text
+            }
+        except Exception as parse_exc:
+            logger.exception("[%s] process_user_text: failed to parse JSON from model output: %s; raw=%r",
+                            call_sid, parse_exc, assistant_text[:1000])
+            # salvage first line as reply
+            first_line = assistant_text.strip().splitlines()[0][:250]
+            return {
+                "intent": "unclear",
+                "confidence": 0.5,
+                "action": "ask_followup",
+                "reply_text": first_line or fallback["reply_text"]
+            }
 
 # 3) Helper to check call status safely
 from twilio.base.exceptions import TwilioRestException
@@ -370,7 +414,6 @@ async def twiml(request: Request):
     logger.info("Action_URL %s",action_url)
     resp.record(max_length=5, action=action_url, play_beep=True, timeout=2)
     return make_twiml_response(str(resp))
-
 @app.post("/recording")
 async def recording(request: Request, background_tasks: BackgroundTasks):
     """
@@ -417,7 +460,9 @@ async def recording(request: Request, background_tasks: BackgroundTasks):
     # helper to schedule deletion of a temp file after a future is done
     async def cleanup_when_done(fut, path):
         try:
-            await asyncio.wrap_future(fut) if isinstance(fut, asyncio.Future) else None
+            # If fut is a concurrent.futures.Future wrapped by asyncio, await its completion safely
+            if isinstance(fut, asyncio.Future):
+                await fut
         except Exception:
             # we don't care about the result, just wait for completion
             pass
@@ -485,13 +530,13 @@ async def recording(request: Request, background_tasks: BackgroundTasks):
         except asyncio.TimeoutError:
             logger.warning("[%s] synchronous processing timed out", call_sid)
             # Do not delete the file here if transcribe_future is still running; schedule cleanup for later.
-            if transcribe_future and not transcribe_future.done() and file_path:
+            if transcribe_future and not getattr(transcribe_future, "done", lambda: True)() and file_path:
                 loop.create_task(cleanup_when_done(transcribe_future, file_path))
             return None
         except Exception as e:
             logger.exception("[%s] synchronous processing failed: %s", call_sid, e)
             # if a future still running, schedule cleanup to avoid leaking temp file
-            if transcribe_future and not transcribe_future.done() and file_path:
+            if transcribe_future and not getattr(transcribe_future, "done", lambda: True)() and file_path:
                 loop.create_task(cleanup_when_done(transcribe_future, file_path))
             else:
                 # safe to remove now
@@ -504,7 +549,8 @@ async def recording(request: Request, background_tasks: BackgroundTasks):
         finally:
             # If transcribe_future is None or completed, it's safe to remove file here.
             try:
-                if (not transcribe_future or (hasattr(transcribe_future, "done") and transcribe_future.done())) and file_path:
+                done_check = (not transcribe_future) or (hasattr(transcribe_future, "done") and transcribe_future.done())
+                if done_check and file_path:
                     if os.path.exists(file_path):
                         os.remove(file_path)
                         logger.debug("[%s] removed temp file in finally: %s", call_sid, file_path)
@@ -530,10 +576,30 @@ async def recording(request: Request, background_tasks: BackgroundTasks):
   <Play>{tts_play_url}</Play>
   <Record maxLength="15" action="{record_action}" playBeep="true" timeout="2"/>
 </Response>"""
-        # Fallback: schedule background processing and return keep-alive TwiML
-        loop = asyncio.get_running_loop()
-        loop.create_task(process_recording_background(call_sid, recording_url, recording_sid, payload))
-        logger.info("[%s] scheduled process_recording_background via loop.create_task", call_sid)
+
+        # Schedule the background coroutine reliably on the event loop (non-blocking)
+        try:
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(process_recording_background(call_sid, recording_url, recording_sid, payload))
+
+            # attach done-callback to surface exceptions
+            def _bg_done(fut):
+                try:
+                    exc = fut.exception()
+                    if exc:
+                        logger.exception("[%s] process_recording_background task finished with exception: %s", call_sid, exc)
+                    else:
+                        logger.info("[%s] process_recording_background task completed successfully", call_sid)
+                except asyncio.CancelledError:
+                    logger.warning("[%s] process_recording_background task cancelled", call_sid)
+
+            task.add_done_callback(_bg_done)
+            logger.info("[%s] scheduled process_recording_background via loop.create_task: %s", call_sid, task)
+        except RuntimeError as e:
+            # fallback if no running loop (rare)
+            background_tasks.add_task(process_recording_background, call_sid, recording_url, recording_sid, payload)
+            logger.warning("[%s] scheduled process_recording_background via BackgroundTasks as fallback: %s", call_sid, e)
+
         return make_twiml_response(twiml)
 
     twiml_keepalive = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -544,6 +610,7 @@ async def recording(request: Request, background_tasks: BackgroundTasks):
     logger.info("[%s] synchronous path failed/slow — scheduled background task and returning keep-alive (pause %ds).",
                 call_sid, KEEPALIVE_SECONDS)
     return make_twiml_response(twiml_keepalive)
+
 
     
 
@@ -656,13 +723,9 @@ async def process_recording_background(
     recording_sid: str | None = None,
     payload: dict | None = None
 ):
-    """
-    Background task: download recording, transcribe, call agent, generate TTS, and update Twilio call.
-    This version is safe: it always produces TwiML and checks call status before updating.
-    """
     file_path = None
     try:
-        logger.info("[%s] downloading recording: %s", call_sid, recording_url)
+        logger.info("[%s] process_recording_background START. recording_url=%r recording_sid=%r", call_sid, recording_url, recording_sid)
         download_url = f"{recording_url}.mp3" if recording_url else None
 
         # --- Download recording from Twilio ---
@@ -670,13 +733,15 @@ async def process_recording_background(
         if download_url:
             auth = HTTPBasicAuth(TWILIO_SID, TWILIO_TOKEN) if (TWILIO_SID and TWILIO_TOKEN) else None
             try:
-                resp = requests.get(download_url, auth=auth, timeout=15)
+                logger.info("[%s] downloading recording from Twilio: %s", call_sid, download_url)
+                resp = requests.get(download_url, auth=auth, timeout=20)
                 resp.raise_for_status()
+                logger.info("[%s] download complete; bytes=%d", call_sid, len(resp.content or b""))
             except Exception as e:
                 logger.exception("[%s] Failed to download recording: %s", call_sid, e)
 
         if not resp or not resp.content:
-            logger.warning("[%s] No audio downloaded; using fallback text", call_sid)
+            logger.warning("[%s] No audio downloaded; skipping transcription and using fallback assistant_text", call_sid)
             assistant_text = "Sorry, I could not hear anything that time. Please try again."
         else:
             # Save to temp file
@@ -685,23 +750,49 @@ async def process_recording_background(
             tmp.flush()
             tmp.close()
             file_path = tmp.name
+            logger.info("[%s] saved recording to temp file: %s", call_sid, file_path)
 
             # --- Transcription ---
             try:
+                logger.info("[%s] starting transcription for %s", call_sid, file_path)
                 transcript = transcribe_with_openai(file_path)
+                logger.info("[%s] transcription result (len=%d): %r", call_sid, len(transcript or ""), transcript)
             except Exception as e:
                 logger.exception("[%s] transcribe_with_openai failed: %s", call_sid, e)
                 transcript = ""
 
+            # If transcript empty -> ask caller to repeat immediately
+            if not transcript or not transcript.strip():
+                logger.info("[%s] transcript empty; will attempt to prompt caller to repeat", call_sid)
+                try:
+                    repeat_text = "Sorry, I didn't hear that. Please repeat after the beep."
+                    s3_key = create_and_upload_tts(repeat_text)
+                    logger.info("[%s] repeat prompt uploaded to s3: %s", call_sid, s3_key)
+                    proxy_path = make_proxy_url(s3_key)
+                    play_url = proxy_path if proxy_path.startswith("http") else (f"https://{HOSTNAME}{proxy_path}" if HOSTNAME else proxy_path)
+                    record_action = f"https://{HOSTNAME}/recording" if HOSTNAME else "/recording"
+                    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play>{play_url}</Play>
+  <Record maxLength="12" action="{record_action}" playBeep="true" timeout="2"/>
+</Response>"""
+                    updated = safe_update_call_with_twiml(call_sid, twiml)
+                    logger.info("[%s] asked caller to repeat -> update attempted: %s", call_sid, updated)
+                except Exception:
+                    logger.exception("[%s] failed to ask caller to repeat", call_sid)
+                # cleanup and exit background for this recording
+                safe_remove_file(file_path)
+                return
+
             # --- Agent (LLM) ---
             try:
-                # process_user_text may be sync or async; run accordingly
+                logger.info("[%s] calling process_user_text with transcript (len=%d)", call_sid, len(transcript))
                 if asyncio.iscoroutinefunction(process_user_text):
-                    logger.info("[%s] transcript from STT (len=%d): %r", call_sid, len(transcript or ""), transcript)
                     result = await process_user_text("default", call_sid, transcript)
                 else:
                     loop = asyncio.get_running_loop()
                     result = await loop.run_in_executor(None, lambda: process_user_text("default", call_sid, transcript))
+                logger.info("[%s] process_user_text returned: %r", call_sid, result)
                 assistant_text = result.get("reply_text") if isinstance(result, dict) else str(result)
             except Exception as e:
                 logger.exception("[%s] process_user_text failed: %s", call_sid, e)
@@ -709,32 +800,27 @@ async def process_recording_background(
 
         # Ensure non-empty assistant_text
         if not assistant_text:
+            logger.warning("[%s] assistant_text empty; using fallback message", call_sid)
             assistant_text = "Sorry, I couldn't understand that. Please try again."
 
         # --- TTS + upload (create S3 key) ---
+        s3_key = None
         try:
+            logger.info("[%s] creating TTS for assistant_text (len=%d)", call_sid, len(assistant_text or ""))
             s3_key = create_and_upload_tts(assistant_text)
             logger.info("[%s] created tts s3 key: %s", call_sid, s3_key)
         except Exception as e:
             logger.exception("[%s] TTS generation failed: %s", call_sid, e)
             s3_key = None
 
-        # --- Build TwiML ---
+        # --- Build TwiML and update call ---
         record_action = f"https://{HOSTNAME}/recording" if HOSTNAME else "/recording"
-
         if s3_key:
-            # Convert S3 key -> proxy path and ensure absolute URL for Twilio
-            proxy_path = make_proxy_url(s3_key)  # may return absolute if HOSTNAME set
+            proxy_path = make_proxy_url(s3_key)
             if proxy_path.startswith("http"):
                 play_url = proxy_path
             else:
-                # make absolute using HOSTNAME (must be set in env for public access)
-                if HOSTNAME:
-                    play_url = f"https://{HOSTNAME}{proxy_path if proxy_path.startswith('/') else '/' + proxy_path}"
-                else:
-                    # best-effort fallback: play whatever proxy_path is (may fail if relative)
-                    play_url = proxy_path
-
+                play_url = f"https://{HOSTNAME}{proxy_path if proxy_path.startswith('/') else '/' + proxy_path}" if HOSTNAME else proxy_path
             twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Play>{play_url}</Play>
@@ -747,15 +833,15 @@ async def process_recording_background(
     <Record maxLength="10" action="{record_action}" playBeep="true" timeout="2"/>
 </Response>"""
 
-        # --- Update Twilio if call still active ---
+        logger.info("[%s] attempting to update Twilio call with TwiML", call_sid)
         updated = safe_update_call_with_twiml(call_sid, twiml)
-        if not updated:
-            logger.info("[%s] Call not updated (not in-progress or failed).", call_sid)
+        logger.info("[%s] Twilio update result: %s", call_sid, updated)
 
     except Exception as e:
         logger.exception("[%s] Unexpected error in process_recording_background: %s", call_sid, e)
     finally:
         safe_remove_file(file_path)
+        logger.info("[%s] process_recording_background FINISHED (cleanup done).", call_sid)
 
 
 # Simple health endpoint
