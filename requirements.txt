@@ -1,30 +1,21 @@
-# core web + ASGI
-fastapi==0.95.0
-uvicorn[standard]==0.22.0
-
-# HTTP + utils
-requests==2.31.0
-python-multipart==0.0.6
-
-# Twilio, OpenAI, AWS
-twilio==9.8.0
-openai>=1.0.0
-
-boto3==1.28.0
-botocore==1.31.0
-
-# TTS
-gTTS==2.4.7
-
-# S3 / AWS helpers (already included via boto3 but keep for clarity)
-# (boto3 brings awscli/botocore; botocore pinned above)
-
-# Optional/dev helpers you may want (uncomment if you use them)
-# python-dotenv==1.0.0
-
-# NOTE: don't add heavy frameworks (langchain etc.) unless you actually use them.
-
+fastapi
+uvicorn[standard]
 langchain
-langchain_community
+openai
+pydantic
+python-multipart
+gunicorn
+aiohttp
+flask
+twilio
+openai
+openai>=1.0.0
+boto3
+gTTS
+gunicorn
+python-dotenv
 redis
 rq
+langchain_community
+requests
+starlette
